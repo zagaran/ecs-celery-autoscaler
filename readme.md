@@ -3,7 +3,7 @@ rather than leaving it running.
 
 # Requirements
 1. Task server running on ECS
-2. Celery using an Elasticache redis instance as the broker
+2. Celery using a redis instance as the broker
 
 # Setup
 1. Add `ecs:DescribeServices` and `ecs:UpdateService` as permissions to your ECS service's IAM policy. 

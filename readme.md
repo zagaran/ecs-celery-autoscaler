@@ -1,4 +1,4 @@
-Async Compute Open Source is a project that allows for scaling of ECS task infrastructure based on demand, 
+ECS Celery Autoscaler is a project that allows for scaling of ECS task infrastructure based on demand, 
 rather than leaving it running.
 
 # Requirements

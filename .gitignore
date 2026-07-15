@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+*.sqlite3
+*.sqlite3-journal
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Editors
+.idea
+.vscode
+
+# Operating systems
+.DS_Store
+
+# Installed packages
+node_modules/
+
+# Compiled Files
+staticfiles/
+staticfiles/*
+
+# Terraform
+**/.terraform/
+*.tfstate
+**/*.tfstate.*.backup
+**/*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
+
+# Lambda build artifacts
+infrastructure/lambda/build/
+infrastructure/lambda/build.zip
+
+# Python packaging
+dist/
+*.egg-info/

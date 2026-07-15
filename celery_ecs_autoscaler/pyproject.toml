@@ -1,0 +1,13 @@
+[project]
+name = "celery-ecs-autoscaler"
+version = "0.1.0"
+description = "Scale an ECS service 0<->1 on Celery task publish/completion"
+requires-python = ">=3.9"
+dependencies = [
+    "boto3>=1.34",
+    "celery>=5.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

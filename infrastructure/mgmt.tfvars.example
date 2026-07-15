@@ -1,0 +1,4 @@
+aws_region = "us-east-1"
+ecs_cluster_name = "my-ecs-cluster"
+ecs_service_name = "my-celery-worker-service"
+ecs_task_role = "my-app-role"

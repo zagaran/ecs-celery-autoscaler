@@ -9,10 +9,10 @@ from typing import Any
 import boto3
 from celery.signals import after_task_publish, task_postrun
 
-log = logging.getLogger("celery_ecs_autoscaler")
+log = logging.getLogger("ecs_celery_autoscaler")
 
 
-class CeleryEcsAutoscaler:
+class EcsCeleryAutoscaler:
     """Scales one ECS service's desiredCount between 0 and 1 based on Celery
     task publish/completion.
     """

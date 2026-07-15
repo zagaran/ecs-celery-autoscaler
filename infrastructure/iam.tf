@@ -1,11 +1,11 @@
 #####################################################################
-# Celery ECS Autoscaler Policy
+# ECS Celery Autoscaler Policy
 #
 # Attached to the client's own publisher-app and Celery-worker IAM roles
 #####################################################################
 
-resource "aws_iam_policy" "celery_ecs_autoscaler" {
-  name        = "celery-ecs-autoscaler-policy"
+resource "aws_iam_policy" "ecs_celery_autoscaler" {
+  name        = "ecs-celery-autoscaler-policy"
   description = "Allows describing/updating desiredCount on the ECS service for event-driven autoscaling."
 
   policy = jsonencode({
@@ -18,7 +18,7 @@ resource "aws_iam_policy" "celery_ecs_autoscaler" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "celery_ecs_autoscaler" {
+resource "aws_iam_role_policy_attachment" "ecs_celery_autoscaler" {
   role       = var.ecs_task_role
-  policy_arn = aws_iam_policy.celery_ecs_autoscaler.arn
+  policy_arn = aws_iam_policy.ecs_celery_autoscaler.arn
 }

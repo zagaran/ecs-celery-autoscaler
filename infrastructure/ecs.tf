@@ -1,6 +1,5 @@
 #####################################################################
-# Data Sources — the celery-scaler Lambda scales this existing
-# service directly
+# Data Sources
 #####################################################################
 
 data "aws_ecs_cluster" "ecs_cluster" {

@@ -8,13 +8,14 @@ rather than leaving it running.
 # Setup
 1. Add `ecs:DescribeServices` and `ecs:UpdateService` as permissions to your ECS service's IAM policy. 
    Terraform instructions are shown below.
-2. Install the `celery_ecs_autoscaler` package into your application's codebase.
-3. Construct a `CeleryEcsAutoscaler` and call `.install()` once at process startup, as top-level code in 
+2. Install the `ecs_celery_autoscaler` package into your application's codebase.
+3. Construct a `EcsCeleryAutoscaler` and call `.install()` once at process startup, as top-level code in 
    whichever module defines your Celery `app`
-```python
-from celery_ecs_autoscaler import CeleryEcsAutoscaler
 
-scaler = CeleryEcsAutoscaler(
+```python
+from ecs_celery_autoscaler import EcsCeleryAutoscaler
+
+scaler = EcsCeleryAutoscaler(
     celery_app=app,
     redis_client=redis.Redis(host="...", decode_responses=True),
     ecs_cluster="my-ecs-cluster",

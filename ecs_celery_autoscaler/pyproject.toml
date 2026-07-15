@@ -1,5 +1,5 @@
 [project]
-name = "celery-ecs-autoscaler"
+name = "ecs-celery-autoscaler"
 version = "0.1.0"
 description = "Scale an ECS service 0<->1 on Celery task publish/completion"
 requires-python = ">=3.9"

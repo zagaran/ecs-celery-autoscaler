@@ -1,6 +1,9 @@
 ECS Celery Autoscaler is a project that allows for scaling of ECS task infrastructure based on demand, 
 rather than leaving it running.
 
+> [!WARNING]
+This package currently does not work for scheduled tasks. They will not run if your service is scaled to 0.
+
 # Requirements
 1. Task server running on ECS
 2. Celery using a redis instance as the broker

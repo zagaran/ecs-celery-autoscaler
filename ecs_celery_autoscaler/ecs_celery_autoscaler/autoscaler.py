@@ -1,20 +1,28 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
+import os
+import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import urllib.request
 from typing import Any
 
 import boto3
-from celery.signals import after_task_publish, task_postrun
+from celery.signals import after_task_publish, task_postrun, task_prerun
 
 log = logging.getLogger("ecs_celery_autoscaler")
 
+LOCK_TIMEOUT = 30
+LOCK_BLOCKING_TIMEOUT = 10
+
 
 class EcsCeleryAutoscaler:
-    """Scales one ECS service's desiredCount between 0 and 1 based on Celery
-    task publish/completion.
+    """Scales one ECS service's desiredCount across 0-max_workers based on Celery
+    queue depth. Safety against killing a busy worker is delegated to ECS task
+    scale-in protection rather than handled by this class.
     """
 
     def __init__(
@@ -26,9 +34,10 @@ class EcsCeleryAutoscaler:
         ecs_service: str,
         aws_region: str,
         queue_name: str = "celery",
-        inspect_timeout: float = 1,
-        inspect_retries: int = 10,
-        inspect_retry_delay: float = 3,
+        min_workers: int = 0,
+        max_workers: int = 1,
+        tasks_per_worker: int = 1,
+        protection_expires_minutes: int = 60,
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
@@ -36,105 +45,102 @@ class EcsCeleryAutoscaler:
         self.ecs_cluster = ecs_cluster
         self.ecs_service = ecs_service
         self.queue_name = queue_name
-        self.inspect_timeout = inspect_timeout
-        self.inspect_retries = inspect_retries
-        self.inspect_retry_delay = inspect_retry_delay
+        self.min_workers = min_workers
+        self.max_workers = max_workers
+        self.tasks_per_worker = tasks_per_worker
+        self.protection_expires_minutes = protection_expires_minutes
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
+        self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
+        self._active_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:active-count:{socket.gethostname()}"
 
     def install(self) -> None:
-        """Wire the signal handlers"""
+        """Wire the signal handlers and start the protection renewal heartbeat."""
         after_task_publish.connect(self._on_publish, weak=False)
+        task_prerun.connect(self._on_prerun, weak=False)
         task_postrun.connect(self._on_postrun, weak=False)
+        if not self.celery_app.conf.task_acks_late:
+            log.warning(
+                "task_acks_late is not enabled — a task killed mid-flight (ECS task protection covers "
+                "scale-in, but not deploys/spot interruption/crashes) will be lost instead of redelivered. "
+                "Strongly recommended for any scale-to-zero/N deployment."
+            )
+        threading.Thread(target=self._protection_renewal_loop, daemon=True).start()
 
     def _on_publish(self, sender=None, routing_key=None, **kwargs):
         if routing_key == self.queue_name:
             self.scale_up()
 
-    def _on_postrun(self, sender=None, task_id=None, **kwargs):
-        """Runs the scale down check in a background thread. This is necessary in the case that Celery runs with
-        multiple workers. The scale down chack should not block the other worker considering this task to be
-        completed.
+    def _on_prerun(self, task_id=None, **kwargs):
+        if self.redis_client.incr(self._active_count_key) == 1:
+            self._set_protection(True)
+
+    def _on_postrun(self, task_id=None, **kwargs):
+        if self.redis_client.decr(self._active_count_key) <= 0:
+            self.redis_client.set(self._active_count_key, 0)
+            self._set_protection(False)
+        threading.Thread(target=self.maybe_scale_down, daemon=True).start()
+
+    def scale_up(self) -> None:
+        """Safe to call unconditionally and often — a no-op once desiredCount already meets target."""
+        self._reconcile()
+
+    def maybe_scale_down(self) -> None:
+        """Recomputes the target worker count and scales toward it. Safe even if a worker is
+        mid-task: ECS task scale-in protection (set via task_prerun/task_postrun) guarantees a busy
+        task is never terminated, so this method doesn't need to know who's busy.
         """
-        threading.Thread(target=self.maybe_scale_down, kwargs={"exclude_task_id": task_id}, daemon=True).start()
+        self._reconcile()
+
+    def _reconcile(self) -> None:
+        try:
+            with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
+                queue_len = self.redis_client.llen(self.queue_name)
+                target = self._target_worker_count(queue_len)
+                current = self._desired_count()
+                if target != current:
+                    self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
+                    log.info("reconciled %s to desiredCount=%d (queue_len=%d)", self.ecs_service, target, queue_len)
+        except Exception:
+            log.exception("reconcile failed for %s", self.ecs_service)
+
+    def _target_worker_count(self, queue_len: int) -> int:
+        return min(self.max_workers, max(self.min_workers, math.ceil(queue_len / self.tasks_per_worker)))
 
     def _desired_count(self) -> int:
         resp = self._ecs.describe_services(cluster=self.ecs_cluster, services=[self.ecs_service])
         return resp["services"][0]["desiredCount"]
 
-    def scale_up(self) -> None:
-        """Safe to call unconditionally and often — a no-op once desiredCount is already 1."""
+    def _set_protection(self, enabled: bool) -> None:
+        agent_uri = os.environ.get("ECS_AGENT_URI")
+        if not agent_uri:
+            return
+        body: dict[str, Any] = {"ProtectionEnabled": enabled}
+        if enabled:
+            body["ExpiresInMinutes"] = self.protection_expires_minutes
         try:
-            if self._desired_count() == 0:
-                self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=1)
-                log.info("scaled %s up to 1", self.ecs_service)
+            req = urllib.request.Request(
+                f"{agent_uri}/task-protection/v1/state",
+                data=json.dumps(body).encode(),
+                method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=5)
         except Exception:
-            log.exception("scale_up failed for %s", self.ecs_service)
+            log.exception("failed to set ECS task protection to %s", enabled)
 
-    def maybe_scale_down(self, exclude_task_id: str | None = None) -> None:
-        """Scales to 0 only if no worker reports an active task AND the queue is
-        empty. If active-task state still can't be determined after retries
-        (broker unreachable, no worker replied), assumes busy and does nothing.
-
-        exclude_task_id: the task that just triggered this check via
-        task_postrun. Celery's worker removes a request from its active-task
-        bookkeeping only after task_postrun fires, so control.inspect().active()
-        can still list the just-finished task as active at this exact instant.
-        """
+    def _should_renew_protection(self) -> bool:
         try:
-            active = None
-            for attempt in range(self.inspect_retries):
-                active = self._active_tasks(exclude_task_id)
-                if active is not None:
-                    break
-                if attempt < self.inspect_retries - 1:
-                    time.sleep(self.inspect_retry_delay)
-            if active is None:
-                log.info("active-task state unknown after %d attempts, not scaling down", self.inspect_retries)
-                return
-            if active:
-                log.info(
-                    "not scaling down %s, exclude_task_id=%r, active tasks reported: %r",
-                    self.ecs_service,
-                    exclude_task_id,
-                    active,
-                )
-                return
-            queue_len = self.redis_client.llen(self.queue_name)
-            if queue_len > 0:
-                log.info("not scaling down %s, %d message(s) still on queue %r", self.ecs_service, queue_len, self.queue_name)
-                return
-            if self._desired_count() > 0:
-                self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=0)
-                log.info("scaled %s down to 0", self.ecs_service)
+            return int(self.redis_client.get(self._active_count_key) or 0) > 0
         except Exception:
-            log.exception("maybe_scale_down failed for %s", self.ecs_service)
+            log.exception("failed to read active task count for %s", self.ecs_service)
+            return False
 
-    def _active_tasks(self, exclude_task_id: str | None = None) -> list | None:
-        """Retrieves a list of tasks being processed by the Celery worker(s).
-        This includes active, reserved, and scheduled tasks.
-        """
-        try:
-            inspector = self.celery_app.control.inspect(timeout=self.inspect_timeout)
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                # Run the three inspector checks concurrently
-                active_future = executor.submit(inspector.active)
-                reserved_future = executor.submit(inspector.reserved)
-                scheduled_future = executor.submit(inspector.scheduled)
-                active_result = active_future.result()
-                reserved_result = reserved_future.result()
-                scheduled_result = scheduled_future.result()
-        except Exception:
-            log.exception("broker unreachable, cannot inspect active/reserved/scheduled tasks")
-            return None
-        if active_result is None or reserved_result is None or scheduled_result is None:
-            return None
-        tasks = [task for tasks in active_result.values() for task in tasks]
-        tasks += [task for tasks in reserved_result.values() for task in tasks]
-        tasks += [
-            entry["request"]
-            for entries in scheduled_result.values()
-            for entry in entries
-        ]
-        if exclude_task_id is not None:
-            tasks = [t for t in tasks if t.get("id") != exclude_task_id]
-        return tasks
+    def _protection_renewal_loop(self) -> None:
+        interval = max(60, self.protection_expires_minutes * 30)
+        while True:
+            time.sleep(interval)
+            try:
+                if self._should_renew_protection():
+                    self._set_protection(True)
+            except Exception:
+                log.exception("protection renewal failed for %s", self.ecs_service)

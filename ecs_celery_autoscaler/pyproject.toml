@@ -1,7 +1,7 @@
 [project]
 name = "ecs-celery-autoscaler"
 version = "0.1.0"
-description = "Scale an ECS service 0<->1 on Celery task publish/completion"
+description = "Scale an ECS service's worker count on Celery task publish/completion"
 requires-python = ">=3.9"
 dependencies = [
     "boto3>=1.34",

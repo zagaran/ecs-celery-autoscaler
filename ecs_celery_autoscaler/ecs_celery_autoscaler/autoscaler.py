@@ -7,6 +7,7 @@ import os
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -125,6 +126,8 @@ class EcsCeleryAutoscaler:
                 headers={"Content-Type": "application/json"},
             )
             urllib.request.urlopen(req, timeout=5)
+        except urllib.error.HTTPError as e:
+            log.error("failed to set ECS task protection to %s: HTTP %d %s", enabled, e.code, e.read())
         except Exception:
             log.exception("failed to set ECS task protection to %s", enabled)
 

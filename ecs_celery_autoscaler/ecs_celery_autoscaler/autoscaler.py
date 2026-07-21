@@ -64,11 +64,11 @@ class EcsCeleryAutoscaler:
         after_task_publish.connect(self._on_publish, weak=False)
         task_received.connect(self._on_received, weak=False)
         task_postrun.connect(self._on_postrun, weak=False)
-        if not self.celery_app.conf.task_acks_late:
+        if not self.celery_app.conf.worker_disable_prefetch:
             log.warning(
-                "task_acks_late is not enabled — a task killed mid-flight (ECS task protection covers "
-                "scale-in, but not deploys/spot interruption/crashes) will be lost instead of redelivered. "
-                "Strongly recommended for any scale-to-zero/N deployment."
+                "worker_disable_prefetch is not enabled — workers that are already connected can "
+                "prefetch tasks faster than they can run them, starving newly scaled-up workers of "
+                "work. Strongly recommended for any scale-to-zero/N deployment."
             )
         threading.Thread(target=self._protection_renewal_loop, daemon=True).start()
 

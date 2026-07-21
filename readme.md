@@ -9,7 +9,7 @@ This package currently does not work for scheduled tasks. They will not run if y
 2. Celery using a redis instance as the broker
 
 # Recommendations
-1. `worker_disable_prefetch = True` set on your Celery app. By default, Celery tasks prefetches jobs from the queue 
+1. `worker_disable_prefetch = True` set on your Celery app. By default, Celery prefetches jobs from the queue 
     and holds them in reserve as it works through the current job. This does not allow for even distribution of jobs
     among the ecs tasks this library spins up for you.
     In django you can enable this setting with
@@ -44,7 +44,8 @@ scaler.install()
 ```
 
 - `min_workers` / `max_workers`: the range `desiredCount` is scaled within. Defaults (`0`/`1`)
-- `tasks_per_worker`: maximum number of tasks each celery worker . Your service will be scaled to `pending_tasks / tasks_per_worker`
+- `tasks_per_worker`: maximum number of tasks for each celery worker to process. It is recommended to set this 
+  to be the number of processes your workers have. Your service will be scaled to `pending_tasks / tasks_per_worker`
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
   renewed (this library renews automatically in the background for tasks that run longer than this).
 - `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to

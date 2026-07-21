@@ -38,8 +38,9 @@ scaler.install()
 
 - `min_workers` / `max_workers`: the range `desiredCount` is scaled within. Defaults (`0`/`1`) match
   this library's original scale-to-zero-or-one behavior exactly.
-- `tasks_per_worker`: target worker count is `ceil(queue_length / tasks_per_worker)`, clamped to
-  `[min_workers, max_workers]`.
+- `tasks_per_worker`: target worker count is `ceil(outstanding_tasks / tasks_per_worker)`, clamped to
+  `[min_workers, max_workers]`, where `outstanding_tasks` is the Redis queue length plus tasks already
+  delivered to a worker but not yet finished.
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
   renewed (this library renews automatically in the background for tasks that run longer than this).
 - `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
@@ -49,17 +50,25 @@ scaler.install()
 This library utilizes Celery's signals to track queue depth and each worker's busy/idle state.
 
 **How many workers:** on every task publish (`after_task_publish`) and task completion
-(`task_postrun`), the target worker count is recomputed from the current Redis queue length
-(`ceil(queue_length / tasks_per_worker)`, clamped to `[min_workers, max_workers]`), and `desiredCount`
-is updated to match if it differs.
+(`task_postrun`), the target worker count is recomputed from `outstanding_tasks` — the Redis queue
+length plus a Redis-tracked count of tasks already delivered to a worker (`task_received`) but not yet
+finished (`task_postrun`) — via `ceil(outstanding_tasks / tasks_per_worker)`, clamped to
+`[min_workers, max_workers]`. `desiredCount` is updated to match if it differs. The queue length alone
+understates real demand once tasks are prefetched off the broker (Celery removes a message from the
+queue as soon as a worker receives it, well before that worker actually starts or finishes it), so
+tracking delivered-but-unfinished tasks separately keeps the target accurate instead of dropping to
+`min_workers` while work is still in flight.
 
 **Which worker is safe to remove:** this library does not decide that itself. Instead, each worker
 marks its own ECS task as protected from scale-in (via the
 [ECS task scale-in protection endpoint](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-scale-in-protection-endpoint.html))
-whenever it has any task running (`task_prerun`) and unprotects itself once idle (`task_postrun`).
-ECS's own scale-in logic guarantees it will never terminate a protected (busy) task when reducing
-`desiredCount` — it simply skips protected tasks and retries later. This means the library never needs
-to broadcast-inspect the worker fleet or guess who's busy.
+as soon as it's been handed any task (`task_received`) and unprotects itself once everything it's been
+handed is finished (`task_postrun`). Protection engages on delivery rather than on execution start, so a
+task that's been delivered but is still waiting for a free pool slot still counts as outstanding work —
+otherwise its container could be stopped before that task ever runs. ECS's own scale-in logic guarantees
+it will never terminate a protected (busy) task when reducing `desiredCount` — it simply skips protected
+tasks and retries later. This means the library never needs to broadcast-inspect the worker fleet or
+guess who's busy.
 
 # Terraform Instructions
 1. Ensure that your aws cli is pointed to the desired AWS account

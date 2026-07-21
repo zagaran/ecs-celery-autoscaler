@@ -12,7 +12,7 @@ import urllib.request
 from typing import Any
 
 import boto3
-from celery.signals import after_task_publish, task_postrun, task_prerun
+from celery.signals import after_task_publish, task_postrun, task_received
 
 log = logging.getLogger("ecs_celery_autoscaler")
 
@@ -54,6 +54,7 @@ class EcsCeleryAutoscaler:
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
         self._active_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:active-count:{socket.gethostname()}"
+        self._pending_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:pending-count"
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
@@ -61,7 +62,7 @@ class EcsCeleryAutoscaler:
             log.warning("AUTOSCALING_ENABLED is false — %s autoscaler is disabled", self.ecs_service)
             return
         after_task_publish.connect(self._on_publish, weak=False)
-        task_prerun.connect(self._on_prerun, weak=False)
+        task_received.connect(self._on_received, weak=False)
         task_postrun.connect(self._on_postrun, weak=False)
         if not self.celery_app.conf.task_acks_late:
             log.warning(
@@ -75,11 +76,19 @@ class EcsCeleryAutoscaler:
         if routing_key == self.queue_name:
             self.scale_up()
 
-    def _on_prerun(self, task_id=None, **kwargs):
+    def _on_received(self, request=None, **kwargs):
+        """Fires the instant a task is delivered to this worker — before it necessarily has a free
+        pool slot to run in. Protection and the pending count must both start here rather than at
+        task_prerun, otherwise a task that's been delivered but is still waiting for a slot isn't
+        counted as outstanding work, and its container can be stopped out from under it.
+        """
+        self.redis_client.incr(self._pending_count_key)
         if self.redis_client.incr(self._active_count_key) == 1:
             self._set_protection(True)
 
     def _on_postrun(self, task_id=None, **kwargs):
+        if self.redis_client.decr(self._pending_count_key) <= 0:
+            self.redis_client.set(self._pending_count_key, 0)
         if self.redis_client.decr(self._active_count_key) <= 0:
             self.redis_client.set(self._active_count_key, 0)
             self._set_protection(False)
@@ -91,7 +100,7 @@ class EcsCeleryAutoscaler:
 
     def maybe_scale_down(self) -> None:
         """Recomputes the target worker count and scales toward it. Safe even if a worker is
-        mid-task: ECS task scale-in protection (set via task_prerun/task_postrun) guarantees a busy
+        mid-task: ECS task scale-in protection (set via task_received/task_postrun) guarantees a busy
         task is never terminated, so this method doesn't need to know who's busy.
         """
         self._reconcile()
@@ -102,16 +111,24 @@ class EcsCeleryAutoscaler:
         try:
             with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
                 queue_len = self.redis_client.llen(self.queue_name)
-                target = self._target_worker_count(queue_len)
+                pending = int(self.redis_client.get(self._pending_count_key) or 0)
+                outstanding = queue_len + pending
+                target = self._target_worker_count(outstanding)
                 current = self._desired_count()
                 if target != current:
                     self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
-                    log.info("reconciled %s to desiredCount=%d (queue_len=%d)", self.ecs_service, target, queue_len)
+                    log.info(
+                        "reconciled %s to desiredCount=%d (queue_len=%d, pending=%d)",
+                        self.ecs_service,
+                        target,
+                        queue_len,
+                        pending,
+                    )
         except Exception:
             log.exception("reconcile failed for %s", self.ecs_service)
 
-    def _target_worker_count(self, queue_len: int) -> int:
-        return min(self.max_workers, max(self.min_workers, math.ceil(queue_len / self.tasks_per_worker)))
+    def _target_worker_count(self, outstanding: int) -> int:
+        return min(self.max_workers, max(self.min_workers, math.ceil(outstanding / self.tasks_per_worker)))
 
     def _desired_count(self) -> int:
         resp = self._ecs.describe_services(cluster=self.ecs_cluster, services=[self.ecs_service])

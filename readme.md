@@ -56,8 +56,8 @@ This library utilizes Celery's signals along with redis statistics to track queu
 
 **How many workers:** on every task publish and task completion, the target worker count is recomputed to be
 `ceil(outstanding_tasks / tasks_per_worker)`, limited by `[min_workers, max_workers]`. The ECS service is then 
-scaled up/down if the target count differs from the current count. Note that an ECS task will terminated if
-it is still processing a task.
+scaled up/down if the target count differs from the current count. Note that an ECS task will not be terminated 
+if it is still processing a task.
 
 **Which worker is safe to remove:** Whenever a worker picks up a task it marks it as protected from scale-in via 
 ECS Task Protection. On task completion, it removes the protection.

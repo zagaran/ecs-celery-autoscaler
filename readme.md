@@ -52,19 +52,14 @@ scaler.install()
   disable the library entirely
 
 # How Does it Work?
-This library utilizes Celery's signals to track queue depth and each worker's busy/idle state.
+This library utilizes Celery's signals along with redis statistics to track queue depth and each worker's processing state.
 
-**How many workers:** on every task publish (`after_task_publish`) and task completion
-(`task_postrun`), the target worker count is recomputed from `outstanding_tasks` — the Redis queue
-length plus a Redis-tracked count of tasks already delivered to a worker (`task_received`) but not yet
-finished (`task_postrun`) — via `ceil(outstanding_tasks / tasks_per_worker)`, clamped to
-`[min_workers, max_workers]`. `desiredCount` is updated to match if it differs.
+**How many workers:** on every task publish and task completion, the target worker count is recomputed to be
+`ceil(outstanding_tasks / tasks_per_worker)`, limited by `[min_workers, max_workers]`. The ECS service is then 
+scaled up/down if the target count differs from the current count.
 
-**Which worker is safe to remove:** this library does not decide that itself. Instead, each worker
-marks its own ECS task as protected from scale-in (via the
-[ECS task scale-in protection endpoint](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-scale-in-protection-endpoint.html))
-as soon as it's been handed any task (`task_received`) and unprotects itself once everything it's been
-handed is finished (`task_postrun`). 
+**Which worker is safe to remove:** Whenever a worker picks up a task it marks it as protected from scale-in via 
+ECS Task Protection. On task completion, it removes the protection.
 
 # Terraform Instructions
 1. Ensure that your aws cli is pointed to the desired AWS account

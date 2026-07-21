@@ -50,12 +50,16 @@ class EcsCeleryAutoscaler:
         self.max_workers = max_workers
         self.tasks_per_worker = tasks_per_worker
         self.protection_expires_minutes = protection_expires_minutes
+        self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
         self._active_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:active-count:{socket.gethostname()}"
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
+        if not self.enabled:
+            log.warning("AUTOSCALING_ENABLED is false — %s autoscaler is disabled", self.ecs_service)
+            return
         after_task_publish.connect(self._on_publish, weak=False)
         task_prerun.connect(self._on_prerun, weak=False)
         task_postrun.connect(self._on_postrun, weak=False)
@@ -93,6 +97,8 @@ class EcsCeleryAutoscaler:
         self._reconcile()
 
     def _reconcile(self) -> None:
+        if not self.enabled:
+            return
         try:
             with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
                 queue_len = self.redis_client.llen(self.queue_name)

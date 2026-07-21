@@ -42,6 +42,8 @@ scaler.install()
   `[min_workers, max_workers]`.
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
   renewed (this library renews automatically in the background for tasks that run longer than this).
+- `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
+  disable the library entirely
 
 # How Does it Work?
 This library utilizes Celery's signals to track queue depth and each worker's busy/idle state.

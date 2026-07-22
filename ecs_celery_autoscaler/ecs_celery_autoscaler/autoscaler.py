@@ -4,11 +4,11 @@ import json
 import logging
 import math
 import os
-import socket
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any
 
 import boto3
@@ -18,6 +18,8 @@ log = logging.getLogger("ecs_celery_autoscaler")
 
 LOCK_TIMEOUT = 30
 LOCK_BLOCKING_TIMEOUT = 10
+PROTECTION_RETRY_INTERVAL = 10
+PROTECTION_RETRY_MAX_ATTEMPTS = 3
 
 
 class EcsCeleryAutoscaler:
@@ -51,9 +53,10 @@ class EcsCeleryAutoscaler:
         self.tasks_per_worker = tasks_per_worker
         self.protection_expires_minutes = protection_expires_minutes
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
+        self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
-        self._active_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:active-count:{socket.gethostname()}"
+        self._active_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:active-count:{self.process_id}"
         self._pending_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:pending-count"
 
     def install(self) -> None:
@@ -71,6 +74,7 @@ class EcsCeleryAutoscaler:
                 "work. Strongly recommended for any scale-to-zero/N deployment."
             )
         threading.Thread(target=self._protection_renewal_loop, daemon=True).start()
+        log.info("Starting autoscaler with process_id: %s", self.process_id)
 
     def _on_publish(self, sender=None, routing_key=None, **kwargs):
         if routing_key == self.queue_name:
@@ -83,8 +87,10 @@ class EcsCeleryAutoscaler:
         counted as outstanding work, and its container can be stopped out from under it.
         """
         self.redis_client.incr(self._pending_count_key)
+        # Only set protection if the new task is the only task on this worker
         if self.redis_client.incr(self._active_count_key) == 1:
-            self._set_protection(True)
+            if not self._set_protection(True):
+                threading.Thread(target=self._retry_protection_until_confirmed, daemon=True).start()
 
     def _on_postrun(self, task_id=None, **kwargs):
         if self.redis_client.decr(self._pending_count_key) <= 0:
@@ -157,6 +163,17 @@ class EcsCeleryAutoscaler:
         except Exception as e:
             log.exception("failed to set ECS task protection to %s: %s", enabled, e)
             return False
+
+    def _retry_protection_until_confirmed(self) -> None:
+        for attempt in range(PROTECTION_RETRY_MAX_ATTEMPTS):
+            time.sleep(PROTECTION_RETRY_INTERVAL)
+            if int(self.redis_client.get(self._active_count_key) or 0) <= 0:
+                return
+            if self._set_protection(True):
+                return
+            log.error(
+                "protection retry %d/%d failed for %s", attempt + 1, PROTECTION_RETRY_MAX_ATTEMPTS, self.ecs_service
+            )
 
     def _should_renew_protection(self) -> bool:
         try:

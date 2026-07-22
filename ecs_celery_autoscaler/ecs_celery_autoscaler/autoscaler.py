@@ -53,6 +53,12 @@ class EcsCeleryAutoscaler:
         self.tasks_per_worker = tasks_per_worker
         self.protection_expires_minutes = protection_expires_minutes
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
+        self.agent_uri = os.environ.get("ECS_AGENT_URI")
+        if not self.agent_uri:
+            log.warning(
+                "ECS_AGENT_URI is not set — %s will not use ECS task scale-in protection",
+                ecs_service,
+            )
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
@@ -142,15 +148,14 @@ class EcsCeleryAutoscaler:
 
     def _set_protection(self, enabled: bool) -> bool:
         """Returns whether protection was confirmed set to `enabled`."""
-        agent_uri = os.environ.get("ECS_AGENT_URI")
-        if not agent_uri:
+        if not self.agent_uri:
             return True
         body: dict[str, Any] = {"ProtectionEnabled": enabled}
         if enabled:
             body["ExpiresInMinutes"] = self.protection_expires_minutes
         try:
             req = urllib.request.Request(
-                f"{agent_uri}/task-protection/v1/state",
+                f"{self.agent_uri}/task-protection/v1/state",
                 data=json.dumps(body).encode(),
                 method="PUT",
                 headers={"Content-Type": "application/json"},

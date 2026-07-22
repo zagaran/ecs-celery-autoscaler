@@ -134,10 +134,11 @@ class EcsCeleryAutoscaler:
         resp = self._ecs.describe_services(cluster=self.ecs_cluster, services=[self.ecs_service])
         return resp["services"][0]["desiredCount"]
 
-    def _set_protection(self, enabled: bool) -> None:
+    def _set_protection(self, enabled: bool) -> bool:
+        """Returns whether protection was confirmed set to `enabled`."""
         agent_uri = os.environ.get("ECS_AGENT_URI")
         if not agent_uri:
-            return
+            return True
         body: dict[str, Any] = {"ProtectionEnabled": enabled}
         if enabled:
             body["ExpiresInMinutes"] = self.protection_expires_minutes
@@ -148,11 +149,14 @@ class EcsCeleryAutoscaler:
                 method="PUT",
                 headers={"Content-Type": "application/json"},
             )
-            urllib.request.urlopen(req, timeout=5)
-        except urllib.error.HTTPError as e:
-            log.error("failed to set ECS task protection to %s: HTTP %d %s", enabled, e.code, e.read())
-        except Exception:
-            log.exception("failed to set ECS task protection to %s", enabled)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                parsed = json.loads(resp.read())
+            if "error" in parsed or "failure" in parsed:
+                raise RuntimeError(parsed.get("error") or parsed.get("failure"))
+            return True
+        except Exception as e:
+            log.exception("failed to set ECS task protection to %s: %s", enabled, e)
+            return False
 
     def _should_renew_protection(self) -> bool:
         try:

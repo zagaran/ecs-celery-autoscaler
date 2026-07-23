@@ -8,9 +8,18 @@ This package currently does not work for scheduled tasks. They will not run if y
 1. Task server running on ECS
 2. Celery using a redis instance as the broker
 
+# Recommendations
+1. `worker_disable_prefetch = True` set on your Celery app. By default, Celery prefetches jobs from the queue 
+    and holds them in reserve as it works through the current job. This does not allow for even distribution of jobs
+    among the ecs tasks this library spins up for you.
+    In django you can enable this setting with
+   ```
+   CELERY_WORKER_DISABLE_PREFETCH = True
+   ```
+
 # Setup
-1. Add `ecs:DescribeServices` and `ecs:UpdateService` as permissions to your ECS service's IAM policy. 
-   Terraform instructions are shown below.
+1. Add `ecs:DescribeServices`, `ecs:UpdateService`, `ecs:GetTaskProtection`, and `ecs:UpdateTaskProtection`
+   as permissions to your ECS service's IAM policy. Terraform instructions are shown below.
 2. Install the `ecs_celery_autoscaler` package into your application's codebase.
 3. Construct a `EcsCeleryAutoscaler` and call `.install()` once at process startup, as top-level code in 
    whichever module defines your Celery `app`
@@ -25,21 +34,33 @@ scaler = EcsCeleryAutoscaler(
     ecs_service="my-celery-worker-service",
     aws_region="us-east-1",
     queue_name="celery",
+    min_workers=0,
+    max_workers=1,
+    tasks_per_worker=1,
+    protection_expires_minutes=60,
 )
 
 scaler.install()
 ```
 
+- `min_workers` / `max_workers`: the range `desiredCount` is scaled within. Defaults (`0`/`1`)
+- `tasks_per_worker`: maximum number of tasks for each celery worker to process. It is recommended to set this 
+  to be the number of processes your workers have. Your service will be scaled to `pending_tasks / tasks_per_worker`
+- `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
+  renewed (this library renews automatically in the background for tasks that run longer than this).
+- `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
+  disable the library entirely
+
 # How Does it Work?
-This library utilizes Celery's signals to check the state of Celery's workers and the redis queue.
+This library utilizes Celery's signals along with redis statistics to track queue depth and each worker's processing state.
 
-Your ECS service is scaled to 0:
-- When a task is published to the queue, the `after_task_publish` signal fires and scales the service up to 1.
+**How many workers:** on every task publish and task completion, the target worker count is recomputed to be
+`ceil(outstanding_tasks / tasks_per_worker)`, limited by `[min_workers, max_workers]`. The ECS service is then 
+scaled up/down if the target count differs from the current count. Note that an ECS task will not be terminated 
+if it is still processing a task.
 
-Your ECS service is scaled to 1:
-- When a task finishes the `task_postrun` signal fires and checks whether any worker
-  still reports any active, scheduled, or reserved tasks and whether the queue is empty. If all are clear, it scales the service down
-  to 0.
+**Which worker is safe to remove:** Whenever a worker picks up a task it marks it as protected from scale-in via 
+ECS Task Protection. On task completion, it removes the protection.
 
 # Terraform Instructions
 1. Ensure that your aws cli is pointed to the desired AWS account
@@ -50,8 +71,9 @@ Your ECS service is scaled to 1:
 terraform init -backend-config="bucket=BUCKET_NAME" -backend-config="region=REGION" -backend-config="key=KEY"
 ```
 5. Apply terraform. This creates an IAM policy scoped to your ECS service (`ecs:DescribeServices` /
-   `ecs:UpdateService`) and attaches it to the IAM role you name in `ecs_task_role` — the role shared
-   by both the publisher and the consumer tasks.
+   `ecs:UpdateService`) and your cluster's tasks (`ecs:GetTaskProtection` / `ecs:UpdateTaskProtection`),
+   and attaches it to the IAM role you name in `ecs_task_role` — the role shared by both the publisher
+   and the consumer tasks.
 ```bash
 terraform apply -var-file=mgmt.tfvars
 ```

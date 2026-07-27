@@ -12,14 +12,48 @@ import uuid
 from typing import Any
 
 import boto3
+from celery.app.control import flatten_reply
 from celery.signals import after_task_publish, task_postrun, task_received
+from celery.worker import state as worker_state
+from celery.worker.control import inspect_command
+from celery.worker.request import Request as WorkerRequest
 
 log = logging.getLogger("ecs_celery_autoscaler")
 
 LOCK_TIMEOUT = 30
 LOCK_BLOCKING_TIMEOUT = 10
-PROTECTION_RETRY_INTERVAL = 10
-PROTECTION_RETRY_MAX_ATTEMPTS = 3
+PROTECTION_POLL_INTERVAL = 5
+INSPECT_TIMEOUT = 1.0
+OUTSTANDING_COMMAND = "ecs_celery_autoscaler_outstanding"
+
+
+def _matches_queue(request, queue_name) -> bool:
+    return (request.delivery_info or {}).get("routing_key") == queue_name
+
+
+def _count_matching_tasks(queue_name, consumer=None) -> int:
+    """Counts reserved tasks (already including actively-executing ones, since Celery only removes
+    them from reserved_requests on completion) plus eta/countdown tasks still waiting in
+    `consumer`'s timer, filtered to `queue_name`. Shared by `_is_busy` and the OUTSTANDING_COMMAND
+    control command so both use one race-free snapshot instead of three separate broadcasts a task
+    could fall through the cracks of."""
+    count = sum(1 for req in set(worker_state.reserved_requests) if _matches_queue(req, queue_name))
+    if consumer is not None:
+        for waiting in list(consumer.timer.schedule.queue):
+            try:
+                scheduled_request = waiting.entry.args[0]
+            except (IndexError, TypeError):
+                continue
+            if isinstance(scheduled_request, WorkerRequest) and _matches_queue(scheduled_request, queue_name):
+                count += 1
+    return count
+
+
+@inspect_command(name=OUTSTANDING_COMMAND, visible=False)
+def _outstanding_for_queue(state, queue_name=None):
+    """Registered as a Celery remote control command, so it always runs in the parent process
+    (wherever Celery's pidbox listener lives) regardless of which process issues the broadcast."""
+    return _count_matching_tasks(queue_name, state.consumer)
 
 
 class EcsCeleryAutoscaler:
@@ -62,8 +96,7 @@ class EcsCeleryAutoscaler:
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
-        self._active_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:active-count:{self.process_id}"
-        self._pending_count_key = f"ecs-celery-autoscaler:{self.ecs_service}:pending-count"
+        self._consumer = None
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
@@ -79,31 +112,22 @@ class EcsCeleryAutoscaler:
                 "prefetch tasks faster than they can run them, starving newly scaled-up workers of "
                 "work. Strongly recommended for any scale-to-zero/N deployment."
             )
-        threading.Thread(target=self._protection_renewal_loop, daemon=True).start()
+        threading.Thread(target=self._protection_loop, daemon=True).start()
         log.info("Starting autoscaler with process_id: %s", self.process_id)
 
     def _on_publish(self, sender=None, routing_key=None, **kwargs):
         if routing_key == self.queue_name:
             self.scale_up()
 
-    def _on_received(self, request=None, **kwargs):
-        """Fires the instant a task is delivered to this worker — before it necessarily has a free
-        pool slot to run in. Protection and the pending count must both start here rather than at
-        task_prerun, otherwise a task that's been delivered but is still waiting for a slot isn't
-        counted as outstanding work, and its container can be stopped out from under it.
-        """
-        self.redis_client.incr(self._pending_count_key)
-        # Only set protection if the new task is the only task on this worker
-        if self.redis_client.incr(self._active_count_key) == 1:
-            if not self._set_protection(True):
-                threading.Thread(target=self._retry_protection_until_confirmed, daemon=True).start()
+    def _on_received(self, sender=None, request=None, **kwargs):
+        """Fires the instant a task is delivered, before it necessarily has a pool slot or is even
+        reserved. Protection must start here rather than at task_prerun, or a task still waiting
+        for a slot could be stopped out from under it."""
+        self._consumer = sender
+        if request is not None and request.delivery_info.get("routing_key") == self.queue_name:
+            self._set_protection(True)
 
     def _on_postrun(self, task_id=None, **kwargs):
-        if self.redis_client.decr(self._pending_count_key) <= 0:
-            self.redis_client.set(self._pending_count_key, 0)
-        if self.redis_client.decr(self._active_count_key) <= 0:
-            self.redis_client.set(self._active_count_key, 0)
-            self._set_protection(False)
         threading.Thread(target=self.maybe_scale_down, daemon=True).start()
 
     def scale_up(self) -> None:
@@ -111,10 +135,9 @@ class EcsCeleryAutoscaler:
         self._reconcile()
 
     def maybe_scale_down(self) -> None:
-        """Recomputes the target worker count and scales toward it. Safe even if a worker is
-        mid-task: ECS task scale-in protection (set via task_received/task_postrun) guarantees a busy
-        task is never terminated, so this method doesn't need to know who's busy.
-        """
+        """Recomputes the target worker count and scales toward it. Safe even mid-task, since ECS
+        scale-in protection guarantees a busy container is never terminated regardless of
+        desiredCount."""
         self._reconcile()
 
     def _reconcile(self) -> None:
@@ -123,7 +146,7 @@ class EcsCeleryAutoscaler:
         try:
             with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
                 queue_len = self.redis_client.llen(self.queue_name)
-                pending = int(self.redis_client.get(self._pending_count_key) or 0)
+                pending = self._pending_count()
                 outstanding = queue_len + pending
                 target = self._target_worker_count(outstanding)
                 current = self._desired_count()
@@ -141,6 +164,21 @@ class EcsCeleryAutoscaler:
 
     def _target_worker_count(self, outstanding: int) -> int:
         return min(self.max_workers, max(self.min_workers, math.ceil(outstanding / self.tasks_per_worker)))
+
+    def _pending_count(self) -> int:
+        """Cluster-wide count of tasks for this queue that are received but not finished, read live
+        via Celery's control plane instead of a hand-maintained redis counter. Uses one
+        OUTSTANDING_COMMAND broadcast rather than active()/reserved()/scheduled() separately, since a
+        task could transition between those states in the gap between calls and be missed by all
+        three. A worker that misses the timeout just isn't counted this pass and gets picked up on
+        the next one."""
+        replies = self.celery_app.control.broadcast(
+            OUTSTANDING_COMMAND,
+            arguments={"queue_name": self.queue_name},
+            reply=True,
+            timeout=INSPECT_TIMEOUT,
+        )
+        return sum(flatten_reply(replies or []).values())
 
     def _desired_count(self) -> int:
         resp = self._ecs.describe_services(cluster=self.ecs_cluster, services=[self.ecs_service])
@@ -169,30 +207,57 @@ class EcsCeleryAutoscaler:
             log.exception("failed to set ECS task protection to %s: %s", enabled, e)
             return False
 
-    def _retry_protection_until_confirmed(self) -> None:
-        for attempt in range(PROTECTION_RETRY_MAX_ATTEMPTS):
-            time.sleep(PROTECTION_RETRY_INTERVAL)
-            if int(self.redis_client.get(self._active_count_key) or 0) <= 0:
-                return
-            if self._set_protection(True):
-                return
-            log.error(
-                "protection retry %d/%d failed for %s", attempt + 1, PROTECTION_RETRY_MAX_ATTEMPTS, self.ecs_service
-            )
-
-    def _should_renew_protection(self) -> bool:
+    def _is_busy(self) -> bool:
+        """Whether this container has any task for this queue that's been received but not finished,
+        read from Celery's own in-process state instead of a redis counter, since `reserved_requests`
+        stays correct in the parent even under the prefork pool. Also checks the consumer's eta
+        timer, since a scheduled task isn't reserved until it fires and would otherwise look idle.
+        Assumes busy if the check itself fails, since this gates whether it's safe to renew or
+        release protection and a failed check is not evidence of safety."""
         try:
-            return int(self.redis_client.get(self._active_count_key) or 0) > 0
+            return _count_matching_tasks(self.queue_name, self._consumer) > 0
         except Exception:
-            log.exception("failed to read active task count for %s", self.ecs_service)
-            return False
+            log.exception("failed to determine busy state for %s; assuming busy", self.ecs_service)
+            return True
 
-    def _protection_renewal_loop(self) -> None:
-        interval = max(60, self.protection_expires_minutes * 30)
+    def _protection_loop(self) -> None:
+        """Renews protection every tick while busy; on the busy-to-idle transition, hands off to
+        `_release_if_idle` rather than releasing directly, since a snapshot alone can't prove
+        nothing arrives a moment later. Ticks on a fixed interval rather than reacting to events,
+        since renewing a long-running task and retrying a failed initial engagement are its only
+        real jobs. A few seconds of extra latency before a release attempt is immaterial next to
+        `protection_expires_minutes`."""
+        was_busy = False
         while True:
-            time.sleep(interval)
+            time.sleep(PROTECTION_POLL_INTERVAL)
             try:
-                if self._should_renew_protection():
+                busy = self._is_busy()
+                if busy:
                     self._set_protection(True)
+                elif was_busy:
+                    self._release_if_idle()
+                was_busy = busy
             except Exception:
-                log.exception("protection renewal failed for %s", self.ecs_service)
+                log.exception("protection poll failed for %s", self.ecs_service)
+
+    def _release_if_idle(self) -> None:
+        """Closes the check-then-act race on releasing protection: a task could arrive the instant
+        after `_is_busy` says idle. Stops new deliveries first (`cancel_task_queue` via `call_soon`,
+        since mutating the consumer off its own thread isn't safe), takes one final snapshot, and
+        only releases if that's still empty, always resuming consumption afterward regardless of
+        outcome since the pause is only to make the snapshot safe."""
+        consumer = self._consumer
+        if consumer is None:
+            return
+
+        def _pause_consumer_then_decide():
+            try:
+                consumer.cancel_task_queue(self.queue_name)
+                if not self._is_busy():
+                    self._set_protection(False)
+            except Exception:
+                log.exception("failed while releasing protection for %s", self.ecs_service)
+            finally:
+                consumer.add_task_queue(self.queue_name)
+
+        consumer.call_soon(_pause_consumer_then_decide)

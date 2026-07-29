@@ -33,10 +33,8 @@ def _matches_queue(request, queue_name) -> bool:
 
 def _count_matching_tasks(queue_name, consumer=None) -> int:
     """Counts reserved tasks (already including actively-executing ones, since Celery only removes
-    them from reserved_requests on completion) plus eta/countdown tasks still waiting in
-    `consumer`'s timer, filtered to `queue_name`. Shared by `_is_busy` and the OUTSTANDING_COMMAND
-    control command so both use one race-free snapshot instead of three separate broadcasts a task
-    could fall through the cracks of."""
+    them from reserved_requests on completion) plus scheduled tasks still waiting in
+    `consumer`'s timer, filtered to `queue_name`."""
     count = sum(1 for req in set(worker_state.reserved_requests) if _matches_queue(req, queue_name))
     if consumer is not None:
         for waiting in list(consumer.timer.schedule.queue):
@@ -110,7 +108,7 @@ class EcsCeleryAutoscaler:
             log.warning(
                 "worker_disable_prefetch is not enabled — workers that are already connected can "
                 "prefetch tasks faster than they can run them, starving newly scaled-up workers of "
-                "work. Strongly recommended for any scale-to-zero/N deployment."
+                "work. It is strongly recommended to enable this setting."
             )
         threading.Thread(target=self._protection_loop, daemon=True).start()
         log.info("Starting autoscaler with process_id: %s", self.process_id)
@@ -167,11 +165,8 @@ class EcsCeleryAutoscaler:
 
     def _pending_count(self) -> int:
         """Cluster-wide count of tasks for this queue that are received but not finished, read live
-        via Celery's control plane instead of a hand-maintained redis counter. Uses one
-        OUTSTANDING_COMMAND broadcast rather than active()/reserved()/scheduled() separately, since a
-        task could transition between those states in the gap between calls and be missed by all
-        three. A worker that misses the timeout just isn't counted this pass and gets picked up on
-        the next one."""
+        via Celery's control plane. A worker that misses the inspect timeout just isn't counted this
+        pass and gets picked up on the next one."""
         replies = self.celery_app.control.broadcast(
             OUTSTANDING_COMMAND,
             arguments={"queue_name": self.queue_name},
@@ -209,11 +204,9 @@ class EcsCeleryAutoscaler:
 
     def _is_busy(self) -> bool:
         """Whether this container has any task for this queue that's been received but not finished,
-        read from Celery's own in-process state instead of a redis counter, since `reserved_requests`
-        stays correct in the parent even under the prefork pool. Also checks the consumer's eta
-        timer, since a scheduled task isn't reserved until it fires and would otherwise look idle.
-        Assumes busy if the check itself fails, since this gates whether it's safe to renew or
-        release protection and a failed check is not evidence of safety."""
+        read from Celery's own in-process state. Also checks the consumer's eta timer, since a
+        scheduled task isn't reserved until it fires and would otherwise look idle.
+        For safety, assumes busy if the check itself fails."""
         try:
             return _count_matching_tasks(self.queue_name, self._consumer) > 0
         except Exception:
@@ -222,11 +215,8 @@ class EcsCeleryAutoscaler:
 
     def _protection_loop(self) -> None:
         """Renews protection every tick while busy; on the busy-to-idle transition, hands off to
-        `_release_if_idle` rather than releasing directly, since a snapshot alone can't prove
-        nothing arrives a moment later. Ticks on a fixed interval rather than reacting to events,
-        since renewing a long-running task and retrying a failed initial engagement are its only
-        real jobs. A few seconds of extra latency before a release attempt is immaterial next to
-        `protection_expires_minutes`."""
+        `_release_if_idle` rather than releasing directly, since a snapshot alone can't prove that
+        nothing arrives a moment later."""
         was_busy = False
         while True:
             time.sleep(PROTECTION_POLL_INTERVAL)
@@ -241,23 +231,30 @@ class EcsCeleryAutoscaler:
                 log.exception("protection poll failed for %s", self.ecs_service)
 
     def _release_if_idle(self) -> None:
-        """Closes the check-then-act race on releasing protection: a task could arrive the instant
-        after `_is_busy` says idle. Stops new deliveries first (`cancel_task_queue` via `call_soon`,
-        since mutating the consumer off its own thread isn't safe), takes one final snapshot, and
-        only releases if that's still empty, always resuming consumption afterward regardless of
-        outcome since the pause is only to make the snapshot safe."""
+        """
+        Removes protection on a worker if it is not currently busy with any jobs
+        """
         consumer = self._consumer
         if consumer is None:
             return
 
         def _pause_consumer_then_decide():
             try:
+                # Stop consumption of new jobs from the queue before checking if any are in progress
                 consumer.cancel_task_queue(self.queue_name)
                 if not self._is_busy():
+                    # If no jobs are in progress on the worker, remove protection
                     self._set_protection(False)
             except Exception:
                 log.exception("failed while releasing protection for %s", self.ecs_service)
             finally:
+                # We need to add the consumer back even if we released protection on this worker. This is because
+                # the ECS agent may choose to kill a different worker with no active protection. If that happens, this
+                # worker needs to be ready to receive future jobs
+                # TODO: Known race condition that in rare cases can lead to dropped tasks. If this worker has protection
+                #  removed, then receives a new job before ECS stops the task the task could be dropped. If on_receive
+                #  runs before ECS kills the task the job will not be lost. Additionally if task_ack = true and
+                #  reject_on_worker_lost = true the job will be
                 consumer.add_task_queue(self.queue_name)
-
+        # Use call_soon to ensure thread safety
         consumer.call_soon(_pause_consumer_then_decide)

@@ -2,7 +2,8 @@ ECS Celery Autoscaler is a project that allows for scaling of ECS task infrastru
 rather than leaving it running.
 
 > [!WARNING]
-This package currently does not work for scheduled tasks. They will not run if your service is scaled to 0.
+This package currently does not work for Celery beat scheduled tasks if `min_workers` is set to 0. 
+Scheduled tasks will not run if the ECS service is scaled to 0.
 
 # Requirements
 1. Task server running on ECS
@@ -12,9 +13,18 @@ This package currently does not work for scheduled tasks. They will not run if y
 1. `worker_disable_prefetch = True` set on your Celery app. By default, Celery prefetches jobs from the queue 
     and holds them in reserve as it works through the current job. This does not allow for even distribution of jobs
     among the ecs tasks this library spins up for you.
-    In django you can enable this setting with
+    In Django you can enable this setting with
    ```
    CELERY_WORKER_DISABLE_PREFETCH = True
+   ```
+2. If your jobs are idempotent, `acks_late = True` and `reject_on_worker_lost = True` set on your Celery app. By 
+   default, Celery acknowledges a job when received. This means the job will not be re-enqueued if it fails. 
+   Queue infrastructure carries an inherent risk of lost jobs, and as long as your jobs are idempotent you can
+   ensure they are retried on failure with these two settings.
+In Django you can enable these settings with
+   ```
+   CELERY_TASK_ACKS_LATE = True
+   CELERY_TASK_REJECT_ON_WORKER_LOST = True
    ```
 
 # Setup

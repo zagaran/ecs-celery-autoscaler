@@ -73,6 +73,7 @@ class EcsCeleryAutoscaler:
         max_workers: int = 1,
         tasks_per_worker: int = 1,
         protection_expires_minutes: int = 60,
+        release_grace_seconds: int = 10,
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
@@ -84,6 +85,7 @@ class EcsCeleryAutoscaler:
         self.max_workers = max_workers
         self.tasks_per_worker = tasks_per_worker
         self.protection_expires_minutes = protection_expires_minutes
+        self.release_grace_seconds = release_grace_seconds
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
         if not self.agent_uri:
@@ -239,22 +241,26 @@ class EcsCeleryAutoscaler:
             return
 
         def _pause_consumer_then_decide():
+            released = False
             try:
                 # Stop consumption of new jobs from the queue before checking if any are in progress
                 consumer.cancel_task_queue(self.queue_name)
                 if not self._is_busy():
                     # If no jobs are in progress on the worker, remove protection
-                    self._set_protection(False)
+                    released = self._set_protection(False)
             except Exception:
                 log.exception("failed while releasing protection for %s", self.ecs_service)
             finally:
                 # We need to add the consumer back even if we released protection on this worker. This is because
                 # the ECS agent may choose to kill a different worker with no active protection. If that happens, this
-                # worker needs to be ready to receive future jobs
-                # TODO: Known race condition that in rare cases can lead to dropped tasks. If this worker has protection
-                #  removed, then receives a new job before ECS stops the task the task could be dropped. If on_receive
-                #  runs before ECS kills the task the job will not be lost. Additionally if task_ack = true and
-                #  reject_on_worker_lost = true the job will be
-                consumer.add_task_queue(self.queue_name)
+                # worker needs to be ready to receive future jobs. If we did release protection, delay the resume by
+                # release_grace_seconds. This shrinks (but can't eliminate) the window where this worker could accept
+                # a new job after losing protection but before ECS actually stops it. If the worker is stopped during
+                # the delay, this scheduled call simply never runs.
+                # TODO: Fix the race condition described above
+                if released:
+                    consumer.timer.call_after(self.release_grace_seconds, consumer.add_task_queue, (self.queue_name,))
+                else:
+                    consumer.add_task_queue(self.queue_name)
         # Use call_soon to ensure thread safety
         consumer.call_soon(_pause_consumer_then_decide)

@@ -48,6 +48,7 @@ scaler = EcsCeleryAutoscaler(
     max_workers=1,
     tasks_per_worker=1,
     protection_expires_minutes=60,
+    release_grace_seconds=10,
 )
 
 scaler.install()
@@ -58,6 +59,9 @@ scaler.install()
   to be the number of processes your workers have. Your service will be scaled to `pending_tasks / tasks_per_worker`
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
   renewed (this library renews automatically in the background for tasks that run longer than this).
+- `release_grace_seconds`: after a worker releases its scale-in protection, how long it waits before
+  resuming task consumption. This narrows (but can't fully close) the window where the worker could
+  accept a new job after losing protection but before ECS actually stops it.
 - `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
   disable the library entirely
 

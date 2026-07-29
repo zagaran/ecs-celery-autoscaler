@@ -1,6 +1,9 @@
 ECS Celery Autoscaler is a project that allows for scaling of ECS task infrastructure based on demand, 
 rather than leaving it running.
 
+This library is best suited for bursty/intermittent workloads, where workers have gaps between jobs.
+See the deployment warning below for why a continuously busy queue is a poor fit.
+
 > [!WARNING]
 This package currently does not work for Celery beat scheduled tasks if `min_workers` is set to 0. 
 Scheduled tasks will not run if the ECS service is scaled to 0.
@@ -59,6 +62,9 @@ scaler.install()
   to be the number of processes your workers have. Your service will be scaled to `pending_tasks / tasks_per_worker`
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
   renewed (this library renews automatically in the background for tasks that run longer than this).
+  Set this to at least your longest anticipated task duration. ECS can refuse renewal calls while a
+  deployment or scale-in is blocked on a protected task (see the deployment note below), so the
+  original grant — not renewal — is what has to cover a task for its full duration in that situation.
 - `release_grace_seconds`: after a worker releases its scale-in protection, how long it waits before
   resuming task consumption. This narrows (but can't fully close) the window where the worker could
   accept a new job after losing protection but before ECS actually stops it.
@@ -75,6 +81,20 @@ if it is still processing a task.
 
 **Which worker is safe to remove:** Whenever a worker picks up a task it marks it as protected from scale-in via 
 ECS Task Protection. On task completion, it removes the protection.
+
+> [!WARNING]
+> ECS honors task scale-in protection during deployments too — a rolling or blue/green deployment will not stop
+> a protected task. If a deployment (or a manual `desiredCount` change) tries to converge below the number of
+> currently protected tasks, ECS marks that convergence `DEPLOYMENT_BLOCKED` and will refuse *all*
+> `UpdateTaskProtection` calls for the affected task until it's unblocked — including this library's own renewal
+> calls. Avoid manually changing `desiredCount` on a service managed by this library while tasks may be in
+> flight; let it own that value.
+>
+> Protection is only released when a worker goes idle, which this library only ever notices between jobs.
+> If a queue keeps a worker continuously busy — the next job always lands before it goes idle — that worker
+> never releases protection and stays `DEPLOYMENT_BLOCKED` indefinitely, making it effectively impossible to
+> deploy new code while that load continues. This library is best suited for bursty/intermittent workloads with
+> real gaps between jobs, not queues that keep a worker saturated.
 
 # Terraform Instructions
 1. Ensure that your aws cli is pointed to the desired AWS account

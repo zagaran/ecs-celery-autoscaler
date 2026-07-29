@@ -13,7 +13,7 @@ from typing import Any
 
 import boto3
 from celery.app.control import flatten_reply
-from celery.signals import after_task_publish, task_postrun, task_received
+from celery.signals import after_task_publish, task_postrun, task_received, worker_shutting_down
 from celery.worker import state as worker_state
 from celery.worker.control import inspect_command
 from celery.worker.request import Request as WorkerRequest
@@ -106,6 +106,7 @@ class EcsCeleryAutoscaler:
         after_task_publish.connect(self._on_publish, weak=False)
         task_received.connect(self._on_received, weak=False)
         task_postrun.connect(self._on_postrun, weak=False)
+        worker_shutting_down.connect(self._on_shutdown, weak=False)
         if not self.celery_app.conf.worker_disable_prefetch:
             log.warning(
                 "worker_disable_prefetch is not enabled — workers that are already connected can "
@@ -129,6 +130,14 @@ class EcsCeleryAutoscaler:
 
     def _on_postrun(self, task_id=None, **kwargs):
         threading.Thread(target=self.maybe_scale_down, daemon=True).start()
+
+    def _on_shutdown(self, sender=None, **kwargs):
+        """Fires on worker shutdown, before the process exits. Without this, a container torn down while busy
+        leaves protection orphaned on that ECS task until protection_expires_minutes elapses, which can then
+        block the next deployment from replacing it too. Only releases if genuinely idle right now — a busy
+        container is already covered by ECS's stopTimeout grace period regardless of protection."""
+        if not self._is_busy():
+            self._set_protection(False)
 
     def scale_up(self) -> None:
         """Safe to call unconditionally and often — a no-op once desiredCount already meets target."""

@@ -20,7 +20,7 @@ from celery.worker.request import Request as WorkerRequest
 
 log = logging.getLogger("ecs_celery_autoscaler")
 
-LOCK_TIMEOUT = 30
+LOCK_TIMEOUT = 90 # Set to be higher than boto's 60s timeout
 LOCK_BLOCKING_TIMEOUT = 10
 PROTECTION_POLL_INTERVAL = 5
 INSPECT_TIMEOUT = 1.0

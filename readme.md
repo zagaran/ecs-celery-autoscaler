@@ -5,8 +5,8 @@ This library is best suited for bursty/intermittent workloads, where workers hav
 See the deployment warning below for why a continuously busy queue is a poor fit.
 
 > [!WARNING]
-This package currently does not work consistently for Celery beat scheduled tasks if `min_workers` is set to 0. 
-Scheduled tasks will not run if the ECS service is scaled to 0.
+Celery Beat will not schedule tasks if the ECS service is scaled to 0. If your service uses Beat it is recommended to
+either run Beat as a sidecar in your web service or as an independent service.
 
 # Requirements
 1. Task server running on ECS

@@ -5,7 +5,7 @@ This library is best suited for bursty/intermittent workloads, where workers hav
 See the deployment warning below for why a continuously busy queue is a poor fit.
 
 > [!WARNING]
-This package currently does not work for Celery beat scheduled tasks if `min_workers` is set to 0. 
+This package currently does not work consistently for Celery beat scheduled tasks if `min_workers` is set to 0. 
 Scheduled tasks will not run if the ECS service is scaled to 0.
 
 # Requirements

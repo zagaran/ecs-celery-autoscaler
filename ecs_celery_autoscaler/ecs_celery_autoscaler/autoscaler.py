@@ -224,12 +224,16 @@ class EcsCeleryAutoscaler:
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 parsed = json.loads(resp.read())
-            if "error" in parsed or "failure" in parsed:
-                raise RuntimeError(parsed.get("error") or parsed.get("failure"))
-            return True
-        except Exception as e:
-            log.exception("failed to set ECS task protection to %s: %s", enabled, e)
+        except Exception:
+            log.exception("failed to set ECS task protection to %s", enabled)
             return False
+        reason = parsed.get("error") or parsed.get("failure")
+        if reason:
+            # Expected once ECS marks a task's convergence DEPLOYMENT_BLOCKED: it then refuses all
+            # UpdateTaskProtection calls for that task, including our own renewal.
+            log.warning("ECS declined to set task protection to %s: %s", enabled, reason)
+            return False
+        return True
 
     def _is_busy(self) -> bool:
         """Whether this container has any task for this queue that's been received but not finished,

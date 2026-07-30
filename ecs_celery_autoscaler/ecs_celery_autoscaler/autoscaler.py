@@ -135,18 +135,26 @@ class EcsCeleryAutoscaler:
         threading.Thread(target=self.maybe_scale_down, daemon=True).start()
 
     def _on_shutdown(self, sender=None, **kwargs):
-        """Fires on worker shutdown, before the process exits. Without this, a container torn down while busy
-        leaves protection orphaned on that ECS task until protection_expires_minutes elapses, which can then
-        block the next deployment from replacing it too. Only releases if genuinely idle right now — a busy
-        container is already covered by ECS's stopTimeout grace period regardless of protection.
-
-        Sets `_shutting_down` and takes `_protection_lock` so this can't lose a race against the protection
-        loop's periodic renewal: without the lock, a renewal PUT in flight when we decide to release could
-        have its response land after ours, leaving the container protected right as it's meant to terminate."""
+        """Fires on worker shutdown, before the process exits and before Celery's own should_stop flag
+        is set, so the consumer is still pulling from the queue. Releases protection only if genuinely
+        idle right now — a busy container is already covered by ECS's stopTimeout regardless — and sets
+        `_shutting_down` so this can't race the protection loop's renewal. Unlike `_release_if_idle`,
+        there's no re-add of the queue afterward, since shutdown is terminal."""
         self._shutting_down.set()
-        with self._protection_lock:
-            if not self._is_busy():
-                self._set_protection(False)
+        consumer = self._consumer
+
+        def _decide():
+            try:
+                self._release_protection_if_idle(consumer)
+            except Exception:
+                log.exception("failed while releasing protection on shutdown for %s", self.ecs_service)
+
+        # A consumer that's still None never received a task, so there's no queue to cancel and no
+        # thread-safety concern requiring call_soon.
+        if consumer is None:
+            _decide()
+        else:
+            consumer.call_soon(_decide)
 
     def scale_up(self) -> None:
         """Safe to call unconditionally and often — a no-op once desiredCount already meets target."""
@@ -256,6 +264,20 @@ class EcsCeleryAutoscaler:
             except Exception:
                 log.exception("protection poll failed for %s", self.ecs_service)
 
+    def _release_protection_if_idle(self, consumer) -> bool:
+        """Cancels consumption of `queue_name` on `consumer` (if given), then atomically rechecks busy
+        state under `_protection_lock` and releases protection if idle, returning whether it did.
+        Canceling first closes the gap where a task could arrive between the check and the release and
+        end up running unprotected; call this from `consumer`'s own thread (e.g. via `call_soon`), since
+        `cancel_task_queue` isn't thread-safe. The lock also stops this from racing the protection loop's
+        renewal, where an in-flight PUT could otherwise land after this release and leave protection on."""
+        if consumer is not None:
+            consumer.cancel_task_queue(self.queue_name)
+        with self._protection_lock:
+            if not self._is_busy():
+                return self._set_protection(False)
+        return False
+
     def _release_if_idle(self) -> None:
         """
         Removes protection on a worker if it is not currently busy with any jobs
@@ -267,12 +289,7 @@ class EcsCeleryAutoscaler:
         def _pause_consumer_then_decide():
             released = False
             try:
-                # Stop consumption of new jobs from the queue before checking if any are in progress
-                consumer.cancel_task_queue(self.queue_name)
-                with self._protection_lock:
-                    if not self._is_busy():
-                        # If no jobs are in progress on the worker, remove protection
-                        released = self._set_protection(False)
+                released = self._release_protection_if_idle(consumer)
             except Exception:
                 log.exception("failed while releasing protection for %s", self.ecs_service)
             finally:

@@ -99,6 +99,7 @@ class EcsCeleryAutoscaler:
         self._consumer = None
         self._protection_lock = threading.Lock()
         self._shutting_down = threading.Event()
+        self._was_busy = False
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
@@ -242,27 +243,35 @@ class EcsCeleryAutoscaler:
             return True
 
     def _protection_loop(self) -> None:
-        """Renews protection every tick while busy; on the busy-to-idle transition, hands off to
-        `_release_if_idle` rather than releasing directly, since a snapshot alone can't prove that
-        nothing arrives a moment later. Stops renewing once `_shutting_down` is set, and takes
-        `_protection_lock` around the renewal call itself so it can't race `_on_shutdown`'s release."""
-        was_busy = False
+        """Sleeps between ticks and hands each tick to `_protection_tick`, scheduled via
+        `consumer.call_soon` so it runs on the consumer's own thread instead of racing its mutation of
+        `worker_state.reserved_requests` and the timer queue. Stops once `_shutting_down` is set."""
         while True:
             time.sleep(PROTECTION_POLL_INTERVAL)
             if self._shutting_down.is_set():
                 return
-            try:
-                busy = self._is_busy()
-                if busy:
-                    with self._protection_lock:
-                        if self._shutting_down.is_set():
-                            return
+            consumer = self._consumer
+            if consumer is None:
+                # No task has been received yet, so there's nothing consumer-owned to race against.
+                self._protection_tick()
+            else:
+                consumer.call_soon(self._protection_tick)
+
+    def _protection_tick(self) -> None:
+        """Renews protection while busy (under `_protection_lock`, so it can't race `_on_shutdown`'s
+        release); on the busy-to-idle transition, hands off to `_release_if_idle` rather than releasing
+        directly, since a snapshot alone can't prove that nothing arrives a moment later."""
+        try:
+            busy = self._is_busy()
+            if busy:
+                with self._protection_lock:
+                    if not self._shutting_down.is_set():
                         self._set_protection(True)
-                elif was_busy:
-                    self._release_if_idle()
-                was_busy = busy
-            except Exception:
-                log.exception("protection poll failed for %s", self.ecs_service)
+            elif self._was_busy:
+                self._release_if_idle()
+            self._was_busy = busy
+        except Exception:
+            log.exception("protection poll failed for %s", self.ecs_service)
 
     def _release_protection_if_idle(self, consumer) -> bool:
         """Cancels consumption of `queue_name` on `consumer` (if given), then atomically rechecks busy

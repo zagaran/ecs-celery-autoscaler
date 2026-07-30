@@ -97,6 +97,8 @@ class EcsCeleryAutoscaler:
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
         self._consumer = None
+        self._protection_lock = threading.Lock()
+        self._shutting_down = threading.Event()
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
@@ -126,7 +128,8 @@ class EcsCeleryAutoscaler:
         for a slot could be stopped out from under it."""
         self._consumer = sender
         if request is not None and request.delivery_info.get("routing_key") == self.queue_name:
-            self._set_protection(True)
+            with self._protection_lock:
+                self._set_protection(True)
 
     def _on_postrun(self, task_id=None, **kwargs):
         threading.Thread(target=self.maybe_scale_down, daemon=True).start()
@@ -135,9 +138,15 @@ class EcsCeleryAutoscaler:
         """Fires on worker shutdown, before the process exits. Without this, a container torn down while busy
         leaves protection orphaned on that ECS task until protection_expires_minutes elapses, which can then
         block the next deployment from replacing it too. Only releases if genuinely idle right now — a busy
-        container is already covered by ECS's stopTimeout grace period regardless of protection."""
-        if not self._is_busy():
-            self._set_protection(False)
+        container is already covered by ECS's stopTimeout grace period regardless of protection.
+
+        Sets `_shutting_down` and takes `_protection_lock` so this can't lose a race against the protection
+        loop's periodic renewal: without the lock, a renewal PUT in flight when we decide to release could
+        have its response land after ours, leaving the container protected right as it's meant to terminate."""
+        self._shutting_down.set()
+        with self._protection_lock:
+            if not self._is_busy():
+                self._set_protection(False)
 
     def scale_up(self) -> None:
         """Safe to call unconditionally and often — a no-op once desiredCount already meets target."""
@@ -227,14 +236,20 @@ class EcsCeleryAutoscaler:
     def _protection_loop(self) -> None:
         """Renews protection every tick while busy; on the busy-to-idle transition, hands off to
         `_release_if_idle` rather than releasing directly, since a snapshot alone can't prove that
-        nothing arrives a moment later."""
+        nothing arrives a moment later. Stops renewing once `_shutting_down` is set, and takes
+        `_protection_lock` around the renewal call itself so it can't race `_on_shutdown`'s release."""
         was_busy = False
         while True:
             time.sleep(PROTECTION_POLL_INTERVAL)
+            if self._shutting_down.is_set():
+                return
             try:
                 busy = self._is_busy()
                 if busy:
-                    self._set_protection(True)
+                    with self._protection_lock:
+                        if self._shutting_down.is_set():
+                            return
+                        self._set_protection(True)
                 elif was_busy:
                     self._release_if_idle()
                 was_busy = busy
@@ -254,9 +269,10 @@ class EcsCeleryAutoscaler:
             try:
                 # Stop consumption of new jobs from the queue before checking if any are in progress
                 consumer.cancel_task_queue(self.queue_name)
-                if not self._is_busy():
-                    # If no jobs are in progress on the worker, remove protection
-                    released = self._set_protection(False)
+                with self._protection_lock:
+                    if not self._is_busy():
+                        # If no jobs are in progress on the worker, remove protection
+                        released = self._set_protection(False)
             except Exception:
                 log.exception("failed while releasing protection for %s", self.ecs_service)
             finally:

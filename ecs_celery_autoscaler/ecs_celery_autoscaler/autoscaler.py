@@ -6,7 +6,6 @@ import math
 import os
 import threading
 import time
-import urllib.error
 import urllib.request
 import uuid
 from typing import Any

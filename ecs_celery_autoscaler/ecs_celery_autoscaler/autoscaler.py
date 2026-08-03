@@ -150,14 +150,14 @@ class EcsCeleryAutoscaler:
 
     def _on_shutdown(self, sender=None, **kwargs):
         """Fires before the process exits; releases protection only if genuinely idle, since a busy
-        container is already covered by ECS's stopTimeout. Unlike `_handle_idle_transition`, the queue
-        isn't re-added afterward — shutdown is terminal."""
+        container is already covered by ECS's stopTimeout. Unlike `_release_protection_resumable`,
+        the queue isn't re-added afterward — shutdown is terminal."""
         self._shutting_down.set()
         consumer = self._consumer
 
         def _release_protection_wrapper():
             try:
-                self._release_protection_if_idle(consumer)
+                self._release_protection_terminal(consumer)
             except Exception:
                 log.exception("failed while releasing protection on shutdown for %s", self.ecs_service)
 
@@ -273,7 +273,7 @@ class EcsCeleryAutoscaler:
         """Renews protection while busy, under `_protection_lock` so it can't race `_on_shutdown`'s
         release. On the busy-to-idle transition, releases terminally if shutdown was already signaled
         (since `_on_shutdown`'s one-shot check can miss a later transition); otherwise defers to
-        `_handle_idle_transition`."""
+        `_release_protection_resumable`."""
         try:
             busy = self._is_busy()
             shutting_down = self._shutting_down.is_set()
@@ -283,9 +283,9 @@ class EcsCeleryAutoscaler:
                         self._set_protection(True)
             elif self._was_busy:
                 if shutting_down:
-                    self._release_protection_if_idle(self._consumer)
+                    self._release_protection_terminal(self._consumer)
                 else:
-                    self._handle_idle_transition()
+                    self._release_protection_resumable()
             self._was_busy = busy
         except Exception:
             log.exception("protection poll failed for %s", self.ecs_service)
@@ -329,7 +329,7 @@ class EcsCeleryAutoscaler:
         else:
             consumer.add_task_queue(self.queue_name)
 
-    def _handle_idle_transition(self) -> None:
+    def _release_protection_resumable(self) -> None:
         """Removes protection on a worker if it is not currently busy with any jobs."""
         consumer = self._consumer
         if consumer is None:
@@ -338,7 +338,7 @@ class EcsCeleryAutoscaler:
         def _pause_consumer_then_decide():
             released = False
             try:
-                released = self._release_protection_if_idle(consumer)
+                released = self._release_protection_terminal(consumer)
             except Exception:
                 log.exception("failed while releasing protection for %s", self.ecs_service)
             finally:
@@ -355,7 +355,7 @@ class EcsCeleryAutoscaler:
         # Use call_soon to ensure thread safety
         consumer.call_soon(_pause_consumer_then_decide)
 
-    def _release_protection_if_idle(self, consumer) -> bool:
+    def _release_protection_terminal(self, consumer) -> bool:
         """Cancels `queue_name` consumption, then atomically rechecks busy state under
         `_protection_lock` and releases protection if idle, returning whether it did. Call only from
         `consumer`'s own thread — canceling first closes the arrival gap between check and release,

@@ -88,11 +88,6 @@ class EcsCeleryAutoscaler:
         self.protection_expires_minutes = protection_expires_minutes
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
-        if not self.agent_uri:
-            log.warning(
-                "ECS_AGENT_URI is not set — %s will not use ECS task scale-in protection",
-                ecs_service,
-            )
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
@@ -105,6 +100,12 @@ class EcsCeleryAutoscaler:
         """Wire the signal handlers and start the protection renewal heartbeat."""
         if not self.enabled:
             log.warning("AUTOSCALING_ENABLED is false — %s autoscaler is disabled", self.ecs_service)
+            return
+        if not self.agent_uri:
+            log.error(
+                "ECS_AGENT_URI is not set — %s will not use ECSCeleryAutoscaler",
+                ecs_service,
+            )
             return
         after_task_publish.connect(self._on_publish, weak=False)
         task_received.connect(self._on_received, weak=False)
@@ -136,10 +137,9 @@ class EcsCeleryAutoscaler:
         threading.Thread(target=self.maybe_scale_down, daemon=True).start()
 
     def _on_shutdown(self, sender=None, **kwargs):
-        """Fires before the process exits, while the consumer is still pulling from the queue; sets
-        `_shutting_down` and releases protection only if genuinely idle, since a busy container is
-        already covered by ECS's stopTimeout. Unlike `_release_if_idle`, the queue isn't re-added
-        afterward — shutdown is terminal."""
+        """Fires before the process exits; releases protection only if genuinely idle, since a busy
+        container is already covered by ECS's stopTimeout. Unlike `_release_if_idle`, the queue isn't
+        re-added afterward — shutdown is terminal."""
         self._shutting_down.set()
         consumer = self._consumer
 
@@ -209,8 +209,6 @@ class EcsCeleryAutoscaler:
 
     def _set_protection(self, enabled: bool) -> bool:
         """Returns whether protection was confirmed set to `enabled`."""
-        if not self.agent_uri:
-            return True
         body: dict[str, Any] = {"ProtectionEnabled": enabled}
         if enabled:
             body["ExpiresInMinutes"] = self.protection_expires_minutes
@@ -276,11 +274,10 @@ class EcsCeleryAutoscaler:
             log.exception("protection poll failed for %s", self.ecs_service)
 
     def _release_protection_if_idle(self, consumer) -> bool:
-        """Cancels consumption of `queue_name`, then atomically rechecks busy state under
-        `_protection_lock` and releases protection if idle, returning whether it did. Canceling first
-        closes the gap where a task could arrive between check and release and run unprotected; call
-        only from `consumer`'s own thread, since `cancel_task_queue` isn't thread-safe, and the lock
-        also guards against racing the protection loop's renewal."""
+        """Cancels `queue_name` consumption, then atomically rechecks busy state under
+        `_protection_lock` and releases protection if idle, returning whether it did. Call only from
+        `consumer`'s own thread — canceling first closes the arrival gap between check and release,
+        and `cancel_task_queue` isn't thread-safe."""
         if consumer is not None:
             consumer.cancel_task_queue(self.queue_name)
         with self._protection_lock:
@@ -290,10 +287,7 @@ class EcsCeleryAutoscaler:
 
     def _task_desired_status(self) -> str | None:
         """Reads this task's own DesiredStatus from the ECS task metadata endpoint. Returns None
-        (inconclusive, not evidence either way) if the check can't be completed, including when no
-        agent is configured."""
-        if not self.agent_uri:
-            return None
+        (inconclusive, not evidence either way) if the check can't be completed."""
         try:
             with urllib.request.urlopen(f"{self.agent_uri}/task", timeout=5) as resp:
                 parsed = json.loads(resp.read())
@@ -303,20 +297,26 @@ class EcsCeleryAutoscaler:
         return parsed.get("DesiredStatus")
 
     def _resume_after_confirming(self, consumer, attempts_left: int) -> None:
-        """Polls this task's DesiredStatus every `RESUME_CHECK_INTERVAL`, up to `RESUME_CHECK_RETRIES`
-        times: STOPPED stops retries for good since `_on_shutdown` takes over, while anything else
-        (RUNNING, or a failed check) keeps retrying and resumes unconditionally once retries run out,
-        since a permanently orphaned consumer is worse than reopening the race this closes.
-        `_shutting_down` is checked once, right after that blocking call, since resuming after
-        shutdown starts would defeat its terminal queue-pause -- `_task_desired_status` returns None
-        with no network call when there's no agent, so that case flows through the same check for
-        free."""
+        """Runs on the consumer's own thread (scheduled via `consumer.timer`), but offloads the
+        DesiredStatus HTTP check itself to a throwaway thread so it doesn't stall the consumer's event
+        loop. The result is handed back to `_decide_resume` via `call_soon`, keeping queue/timer
+        mutation on the consumer thread."""
+        threading.Thread(target=self._check_status_then_decide, args=(consumer, attempts_left), daemon=True).start()
+
+    def _check_status_then_decide(self, consumer, attempts_left: int) -> None:
         status = self._task_desired_status()
+        consumer.call_soon(self._decide_resume, consumer, attempts_left, status)
+
+    def _decide_resume(self, consumer, attempts_left: int, status: str | None) -> None:
+        """Retries up to `RESUME_CHECK_RETRIES` times, `RESUME_CHECK_INTERVAL` apart, until STOPPED
+        (handled by `_on_shutdown`) or attempts run out — then resumes unconditionally, since an
+        orphaned consumer is worse than reopening this race. Also checked against `_shutting_down`,
+        since resuming after shutdown starts would defeat its terminal queue-pause."""
         if self._shutting_down.is_set():
             return
         if status == "STOPPED":
             return
-        if self.agent_uri and attempts_left > 1:
+        if attempts_left > 1:
             consumer.timer.call_after(
                 RESUME_CHECK_INTERVAL, self._resume_after_confirming, (consumer, attempts_left - 1)
             )

@@ -33,9 +33,8 @@ def _matches_queue(request, queue_name) -> bool:
 
 
 def _count_matching_tasks(queue_name, consumer=None) -> int:
-    """Counts reserved tasks (already including actively-executing ones, since Celery only removes
-    them from reserved_requests on completion) plus scheduled tasks still waiting in
-    `consumer`'s timer, filtered to `queue_name`."""
+    """Counts reserved tasks for `queue_name` (includes actively-executing ones, since Celery only
+    clears them on completion) plus tasks still waiting in `consumer`'s timer."""
     count = sum(1 for req in set(worker_state.reserved_requests) if _matches_queue(req, queue_name))
     if consumer is not None:
         for waiting in list(consumer.timer.schedule.queue):
@@ -51,7 +50,7 @@ def _count_matching_tasks(queue_name, consumer=None) -> int:
 @inspect_command(name=OUTSTANDING_COMMAND, visible=False)
 def _outstanding_for_queue(state, queue_name=None):
     """Registered as a Celery remote control command, so it always runs in the parent process
-    (wherever Celery's pidbox listener lives) regardless of which process issues the broadcast."""
+    regardless of which process issues the broadcast."""
     return _count_matching_tasks(queue_name, state.consumer)
 
 
@@ -138,9 +137,9 @@ class EcsCeleryAutoscaler:
             threading.Thread(target=self.maybe_scale_service, daemon=True).start()
 
     def _on_received(self, sender=None, request=None, **kwargs):
-        """Fires the instant a task is delivered, before it necessarily has a pool slot or is even
-        reserved. Protection must start here rather than at task_prerun, or a task still waiting
-        for a slot could be stopped out from under it."""
+        """Fires the instant a task is delivered, before it's necessarily reserved or has a pool
+        slot. Protection must start here rather than at task_prerun, or a task still waiting for
+        a slot could be stopped out from under it."""
         self._consumer = sender
         if request is not None and request.delivery_info.get("routing_key") == self.queue_name:
             with self._protection_lock:
@@ -255,13 +254,11 @@ class EcsCeleryAutoscaler:
             return True
 
     def _protection_loop(self) -> None:
-        """Sleeps between ticks and hands each tick to `_protection_tick`, scheduled via
-        `consumer.call_soon` so it runs on the consumer's own thread instead of racing its mutation of
-        `worker_state.reserved_requests` and the timer queue. Stops once `_shutting_down` is set."""
+        """Ticks every `PROTECTION_POLL_INTERVAL` seconds via `consumer.call_soon`, keeping
+        `_protection_tick` on the consumer's own thread instead of racing Celery's state. Never stops,
+        even after shutdown, since a task busy at that point may not go idle until long after."""
         while True:
             time.sleep(PROTECTION_POLL_INTERVAL)
-            if self._shutting_down.is_set():
-                return
             consumer = self._consumer
             try:
                 if consumer is None:
@@ -274,23 +271,28 @@ class EcsCeleryAutoscaler:
 
     def _protection_tick(self) -> None:
         """Renews protection while busy, under `_protection_lock` so it can't race `_on_shutdown`'s
-        release. On the busy-to-idle transition, hands off to `_handle_idle_transition` rather than
-        releasing directly, since a snapshot alone can't prove nothing arrives a moment later."""
+        release. On the busy-to-idle transition, releases terminally if shutdown was already signaled
+        (since `_on_shutdown`'s one-shot check can miss a later transition); otherwise defers to
+        `_handle_idle_transition`."""
         try:
             busy = self._is_busy()
+            shutting_down = self._shutting_down.is_set()
             if busy:
                 with self._protection_lock:
-                    if not self._shutting_down.is_set():
+                    if not shutting_down:
                         self._set_protection(True)
             elif self._was_busy:
-                self._handle_idle_transition()
+                if shutting_down:
+                    self._release_protection_if_idle(self._consumer)
+                else:
+                    self._handle_idle_transition()
             self._was_busy = busy
         except Exception:
             log.exception("protection poll failed for %s", self.ecs_service)
 
     def _task_desired_status(self) -> str | None:
-        """Reads this task's own DesiredStatus from the ECS task metadata endpoint — `metadata_uri`,
-        Returns None (inconclusive, not evidence either way) if the check can't be completed."""
+        """Reads this task's own DesiredStatus from the ECS task metadata endpoint. Returns None
+        (inconclusive either way) if the check can't be completed."""
         try:
             with urllib.request.urlopen(f"{self.metadata_uri}/task", timeout=5) as resp:
                 parsed = json.loads(resp.read())
@@ -300,10 +302,9 @@ class EcsCeleryAutoscaler:
         return parsed.get("DesiredStatus")
 
     def _resume_after_confirming(self, consumer, attempts_left: int) -> None:
-        """Runs on the consumer's own thread (scheduled via `consumer.timer`), but offloads the
-        DesiredStatus HTTP check itself to a throwaway thread so it doesn't stall the consumer's event
-        loop. The result is handed back to `_decide_resume` via `call_soon`, keeping queue/timer
-        mutation on the consumer thread."""
+        """Runs on the consumer's own thread, but offloads the DesiredStatus check to a throwaway
+        thread so it doesn't stall the event loop. The result is handed back via `call_soon`,
+        keeping queue/timer mutation on the consumer thread."""
         threading.Thread(target=self._check_status_then_decide, args=(consumer, attempts_left), daemon=True).start()
 
     def _check_status_then_decide(self, consumer, attempts_left: int) -> None:
@@ -314,10 +315,9 @@ class EcsCeleryAutoscaler:
             log.exception("failed to schedule resume decision for %s", self.ecs_service)
 
     def _decide_resume(self, consumer, attempts_left: int, status: str | None) -> None:
-        """Retries up to `RESUME_CHECK_RETRIES` times, `RESUME_CHECK_INTERVAL` apart, until STOPPED
-        (handled by `_on_shutdown`) or attempts run out — then resumes unconditionally, since an
-        orphaned consumer is worse than reopening this race. Also checked against `_shutting_down`,
-        since resuming after shutdown starts would defeat its terminal queue-pause."""
+        """Retries up to `RESUME_CHECK_RETRIES` times, `RESUME_CHECK_INTERVAL` apart, then resumes
+        unconditionally once attempts run out, since an orphaned consumer is worse than reopening
+        this race. Bails early if `_shutting_down` is set or ECS already marked the task STOPPED."""
         if self._shutting_down.is_set():
             return
         if status == "STOPPED":

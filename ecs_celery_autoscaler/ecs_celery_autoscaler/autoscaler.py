@@ -98,6 +98,7 @@ class EcsCeleryAutoscaler:
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
+        # Check configuration first and error/warn depending on severity
         if not self.enabled:
             log.warning("AUTOSCALING_ENABLED is false — %s will not use ECSCeleryAutoscaler", self.ecs_service)
             return
@@ -113,22 +114,28 @@ class EcsCeleryAutoscaler:
                 self.ecs_service,
             )
             return
-        after_task_publish.connect(self._on_publish, weak=False)
-        task_received.connect(self._on_received, weak=False)
-        task_postrun.connect(self._on_postrun, weak=False)
-        worker_shutting_down.connect(self._on_shutdown, weak=False)
+
         if not self.celery_app.conf.worker_disable_prefetch:
             log.warning(
                 "worker_disable_prefetch is not enabled — workers that are already connected can "
                 "prefetch tasks faster than they can run them, starving newly scaled-up workers of "
                 "work. It is strongly recommended to enable this setting."
             )
+
+        # Wire signals
+        after_task_publish.connect(self._on_publish, weak=False)
+        task_received.connect(self._on_received, weak=False)
+        task_postrun.connect(self._on_postrun, weak=False)
+        worker_shutting_down.connect(self._on_shutdown, weak=False)
+
+        # Start background thread responsible for renewing task protection
         threading.Thread(target=self._protection_loop, daemon=True).start()
+
         log.info("Starting autoscaler with process_id: %s", self.process_id)
 
     def _on_publish(self, sender=None, routing_key=None, **kwargs):
         if routing_key == self.queue_name:
-            threading.Thread(target=self.scale_up, daemon=True).start()
+            threading.Thread(target=self.maybe_scale_service, daemon=True).start()
 
     def _on_received(self, sender=None, request=None, **kwargs):
         """Fires the instant a task is delivered, before it necessarily has a pool slot or is even
@@ -140,16 +147,16 @@ class EcsCeleryAutoscaler:
                 self._set_protection(True)
 
     def _on_postrun(self, task_id=None, **kwargs):
-        threading.Thread(target=self.maybe_scale_down, daemon=True).start()
+        threading.Thread(target=self.maybe_scale_service, daemon=True).start()
 
     def _on_shutdown(self, sender=None, **kwargs):
         """Fires before the process exits; releases protection only if genuinely idle, since a busy
-        container is already covered by ECS's stopTimeout. Unlike `_release_if_idle`, the queue isn't
-        re-added afterward — shutdown is terminal."""
+        container is already covered by ECS's stopTimeout. Unlike `_handle_idle_transition`, the queue
+        isn't re-added afterward — shutdown is terminal."""
         self._shutting_down.set()
         consumer = self._consumer
 
-        def _decide():
+        def _release_protection_wrapper():
             try:
                 self._release_protection_if_idle(consumer)
             except Exception:
@@ -158,21 +165,14 @@ class EcsCeleryAutoscaler:
         # A consumer that's still None never received a task, so there's no queue to cancel and no
         # thread-safety concern requiring call_soon.
         if consumer is None:
-            _decide()
+            _release_protection_wrapper()
         else:
-            consumer.call_soon(_decide)
+            consumer.call_soon(_release_protection_wrapper)
 
-    def scale_up(self) -> None:
-        """Safe to call unconditionally and often — a no-op once desiredCount already meets target."""
-        self._reconcile()
-
-    def maybe_scale_down(self) -> None:
+    def maybe_scale_service(self) -> None:
         """Recomputes the target worker count and scales toward it. Safe even mid-task, since ECS
         scale-in protection guarantees a busy container is never terminated regardless of
         desiredCount."""
-        self._reconcile()
-
-    def _reconcile(self) -> None:
         if not self.enabled:
             return
         try:
@@ -188,7 +188,7 @@ class EcsCeleryAutoscaler:
                 if target != current:
                     self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
                     log.info(
-                        "reconciled %s to desiredCount=%d (queue_len=%d, pending=%d, busy_workers=%d)",
+                        "scaled %s to desiredCount=%d (queue_len=%d, pending=%d, busy_workers=%d)",
                         self.ecs_service,
                         target,
                         queue_len,
@@ -196,7 +196,7 @@ class EcsCeleryAutoscaler:
                         busy_workers,
                     )
         except Exception:
-            log.exception("reconcile failed for %s", self.ecs_service)
+            log.exception("Autoscaling failed for %s", self.ecs_service)
 
     def _target_worker_count(self, outstanding: int) -> int:
         return min(self.max_workers, max(self.min_workers, math.ceil(outstanding / self.tasks_per_worker)))
@@ -274,8 +274,8 @@ class EcsCeleryAutoscaler:
 
     def _protection_tick(self) -> None:
         """Renews protection while busy, under `_protection_lock` so it can't race `_on_shutdown`'s
-        release. On the busy-to-idle transition, hands off to `_release_if_idle` rather than releasing
-        directly, since a snapshot alone can't prove nothing arrives a moment later."""
+        release. On the busy-to-idle transition, hands off to `_handle_idle_transition` rather than
+        releasing directly, since a snapshot alone can't prove nothing arrives a moment later."""
         try:
             busy = self._is_busy()
             if busy:
@@ -283,22 +283,10 @@ class EcsCeleryAutoscaler:
                     if not self._shutting_down.is_set():
                         self._set_protection(True)
             elif self._was_busy:
-                self._release_if_idle()
+                self._handle_idle_transition()
             self._was_busy = busy
         except Exception:
             log.exception("protection poll failed for %s", self.ecs_service)
-
-    def _release_protection_if_idle(self, consumer) -> bool:
-        """Cancels `queue_name` consumption, then atomically rechecks busy state under
-        `_protection_lock` and releases protection if idle, returning whether it did. Call only from
-        `consumer`'s own thread — canceling first closes the arrival gap between check and release,
-        and `cancel_task_queue` isn't thread-safe."""
-        if consumer is not None:
-            consumer.cancel_task_queue(self.queue_name)
-        with self._protection_lock:
-            if not self._is_busy():
-                return self._set_protection(False)
-        return False
 
     def _task_desired_status(self) -> str | None:
         """Reads this task's own DesiredStatus from the ECS task metadata endpoint — `metadata_uri`,
@@ -341,7 +329,7 @@ class EcsCeleryAutoscaler:
         else:
             consumer.add_task_queue(self.queue_name)
 
-    def _release_if_idle(self) -> None:
+    def _handle_idle_transition(self) -> None:
         """Removes protection on a worker if it is not currently busy with any jobs."""
         consumer = self._consumer
         if consumer is None:
@@ -354,7 +342,7 @@ class EcsCeleryAutoscaler:
             except Exception:
                 log.exception("failed while releasing protection for %s", self.ecs_service)
             finally:
-                # We need to add the consumer back even if we released protection on this worker. This is because
+                # Add the consumer back even if we released protection on this worker. This is because
                 # the ECS agent may choose to kill a different worker with no active protection. If that happens, this
                 # worker needs to be ready to receive future jobs. If we did release protection, don't resume until
                 # `_resume_after_confirming` has confirmed ECS hasn't already decided to stop this task.
@@ -366,3 +354,15 @@ class EcsCeleryAutoscaler:
                     consumer.add_task_queue(self.queue_name)
         # Use call_soon to ensure thread safety
         consumer.call_soon(_pause_consumer_then_decide)
+
+    def _release_protection_if_idle(self, consumer) -> bool:
+        """Cancels `queue_name` consumption, then atomically rechecks busy state under
+        `_protection_lock` and releases protection if idle, returning whether it did. Call only from
+        `consumer`'s own thread — canceling first closes the arrival gap between check and release,
+        and `cancel_task_queue` isn't thread-safe."""
+        if consumer is not None:
+            consumer.cancel_task_queue(self.queue_name)
+        with self._protection_lock:
+            if not self._is_busy():
+                return self._set_protection(False)
+        return False

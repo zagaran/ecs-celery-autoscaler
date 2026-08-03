@@ -51,7 +51,6 @@ scaler = EcsCeleryAutoscaler(
     max_workers=1,
     tasks_per_worker=1,
     protection_expires_minutes=60,
-    release_grace_seconds=10,
 )
 
 scaler.install()
@@ -65,9 +64,9 @@ scaler.install()
   Set this to at least your longest anticipated task duration. ECS can refuse renewal calls while a
   deployment or scale-in is blocked on a protected task (see the deployment note below), so the
   original grant — not renewal — is what has to cover a task for its full duration in that situation.
-- `release_grace_seconds`: after a worker releases its scale-in protection, how long it waits before
-  resuming task consumption. This narrows (but can't fully close) the window where the worker could
-  accept a new job after losing protection but before ECS actually stops it.
+- After a worker releases its scale-in protection, it doesn't resume task consumption until it has
+  confirmed via the ECS task metadata endpoint that ECS hasn't already decided to stop it (checked a
+  few times, spaced out, since ECS can take a moment to record that decision after protection drops).
 - `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
   disable the library entirely
 

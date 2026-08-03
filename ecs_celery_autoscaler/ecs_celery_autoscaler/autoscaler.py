@@ -23,6 +23,8 @@ log = logging.getLogger("ecs_celery_autoscaler")
 LOCK_TIMEOUT = 90 # Set to be higher than boto's 60s timeout
 LOCK_BLOCKING_TIMEOUT = 10
 PROTECTION_POLL_INTERVAL = 5
+RESUME_CHECK_RETRIES = 6
+RESUME_CHECK_INTERVAL = 15
 INSPECT_TIMEOUT = 1.0
 OUTSTANDING_COMMAND = "ecs_celery_autoscaler_outstanding"
 
@@ -73,7 +75,6 @@ class EcsCeleryAutoscaler:
         max_workers: int = 1,
         tasks_per_worker: int = 1,
         protection_expires_minutes: int = 60,
-        release_grace_seconds: int = 10,
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
@@ -85,7 +86,6 @@ class EcsCeleryAutoscaler:
         self.max_workers = max_workers
         self.tasks_per_worker = tasks_per_worker
         self.protection_expires_minutes = protection_expires_minutes
-        self.release_grace_seconds = release_grace_seconds
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
         if not self.agent_uri:
@@ -136,11 +136,10 @@ class EcsCeleryAutoscaler:
         threading.Thread(target=self.maybe_scale_down, daemon=True).start()
 
     def _on_shutdown(self, sender=None, **kwargs):
-        """Fires on worker shutdown, before the process exits and before Celery's own should_stop flag
-        is set, so the consumer is still pulling from the queue. Releases protection only if genuinely
-        idle right now — a busy container is already covered by ECS's stopTimeout regardless — and sets
-        `_shutting_down` so this can't race the protection loop's renewal. Unlike `_release_if_idle`,
-        there's no re-add of the queue afterward, since shutdown is terminal."""
+        """Fires before the process exits, while the consumer is still pulling from the queue; sets
+        `_shutting_down` and releases protection only if genuinely idle, since a busy container is
+        already covered by ECS's stopTimeout. Unlike `_release_if_idle`, the queue isn't re-added
+        afterward — shutdown is terminal."""
         self._shutting_down.set()
         consumer = self._consumer
 
@@ -236,10 +235,9 @@ class EcsCeleryAutoscaler:
         return True
 
     def _is_busy(self) -> bool:
-        """Whether this container has any task for this queue that's been received but not finished,
-        read from Celery's own in-process state. Also checks the consumer's eta timer, since a
-        scheduled task isn't reserved until it fires and would otherwise look idle.
-        For safety, assumes busy if the check itself fails."""
+        """Whether this container has any unfinished task for this queue, read from Celery's
+        in-process state plus the consumer's eta timer (a scheduled task isn't reserved until it
+        fires). Assumes busy if the check itself fails, for safety."""
         try:
             return _count_matching_tasks(self.queue_name, self._consumer) > 0
         except Exception:
@@ -262,9 +260,9 @@ class EcsCeleryAutoscaler:
                 consumer.call_soon(self._protection_tick)
 
     def _protection_tick(self) -> None:
-        """Renews protection while busy (under `_protection_lock`, so it can't race `_on_shutdown`'s
-        release); on the busy-to-idle transition, hands off to `_release_if_idle` rather than releasing
-        directly, since a snapshot alone can't prove that nothing arrives a moment later."""
+        """Renews protection while busy, under `_protection_lock` so it can't race `_on_shutdown`'s
+        release. On the busy-to-idle transition, hands off to `_release_if_idle` rather than releasing
+        directly, since a snapshot alone can't prove nothing arrives a moment later."""
         try:
             busy = self._is_busy()
             if busy:
@@ -278,12 +276,11 @@ class EcsCeleryAutoscaler:
             log.exception("protection poll failed for %s", self.ecs_service)
 
     def _release_protection_if_idle(self, consumer) -> bool:
-        """Cancels consumption of `queue_name` on `consumer` (if given), then atomically rechecks busy
-        state under `_protection_lock` and releases protection if idle, returning whether it did.
-        Canceling first closes the gap where a task could arrive between the check and the release and
-        end up running unprotected; call this from `consumer`'s own thread (e.g. via `call_soon`), since
-        `cancel_task_queue` isn't thread-safe. The lock also stops this from racing the protection loop's
-        renewal, where an in-flight PUT could otherwise land after this release and leave protection on."""
+        """Cancels consumption of `queue_name`, then atomically rechecks busy state under
+        `_protection_lock` and releases protection if idle, returning whether it did. Canceling first
+        closes the gap where a task could arrive between check and release and run unprotected; call
+        only from `consumer`'s own thread, since `cancel_task_queue` isn't thread-safe, and the lock
+        also guards against racing the protection loop's renewal."""
         if consumer is not None:
             consumer.cancel_task_queue(self.queue_name)
         with self._protection_lock:
@@ -291,10 +288,43 @@ class EcsCeleryAutoscaler:
                 return self._set_protection(False)
         return False
 
+    def _task_desired_status(self) -> str | None:
+        """Reads this task's own DesiredStatus from the ECS task metadata endpoint. Returns None
+        (inconclusive, not evidence either way) if the check can't be completed, including when no
+        agent is configured."""
+        if not self.agent_uri:
+            return None
+        try:
+            with urllib.request.urlopen(f"{self.agent_uri}/task", timeout=5) as resp:
+                parsed = json.loads(resp.read())
+        except Exception:
+            log.exception("failed to check task status for %s", self.ecs_service)
+            return None
+        return parsed.get("DesiredStatus")
+
+    def _resume_after_confirming(self, consumer, attempts_left: int) -> None:
+        """Polls this task's DesiredStatus every `RESUME_CHECK_INTERVAL`, up to `RESUME_CHECK_RETRIES`
+        times: STOPPED stops retries for good since `_on_shutdown` takes over, while anything else
+        (RUNNING, or a failed check) keeps retrying and resumes unconditionally once retries run out,
+        since a permanently orphaned consumer is worse than reopening the race this closes.
+        `_shutting_down` is checked once, right after that blocking call, since resuming after
+        shutdown starts would defeat its terminal queue-pause -- `_task_desired_status` returns None
+        with no network call when there's no agent, so that case flows through the same check for
+        free."""
+        status = self._task_desired_status()
+        if self._shutting_down.is_set():
+            return
+        if status == "STOPPED":
+            return
+        if self.agent_uri and attempts_left > 1:
+            consumer.timer.call_after(
+                RESUME_CHECK_INTERVAL, self._resume_after_confirming, (consumer, attempts_left - 1)
+            )
+        else:
+            consumer.add_task_queue(self.queue_name)
+
     def _release_if_idle(self) -> None:
-        """
-        Removes protection on a worker if it is not currently busy with any jobs
-        """
+        """Removes protection on a worker if it is not currently busy with any jobs."""
         consumer = self._consumer
         if consumer is None:
             return
@@ -308,13 +338,12 @@ class EcsCeleryAutoscaler:
             finally:
                 # We need to add the consumer back even if we released protection on this worker. This is because
                 # the ECS agent may choose to kill a different worker with no active protection. If that happens, this
-                # worker needs to be ready to receive future jobs. If we did release protection, delay the resume by
-                # release_grace_seconds. This shrinks (but can't eliminate) the window where this worker could accept
-                # a new job after losing protection but before ECS actually stops it. If the worker is stopped during
-                # the delay, this scheduled call simply never runs.
-                # TODO: Fix the race condition described above
+                # worker needs to be ready to receive future jobs. If we did release protection, don't resume until
+                # `_resume_after_confirming` has confirmed ECS hasn't already decided to stop this task.
                 if released:
-                    consumer.timer.call_after(self.release_grace_seconds, consumer.add_task_queue, (self.queue_name,))
+                    consumer.timer.call_after(
+                        RESUME_CHECK_INTERVAL, self._resume_after_confirming, (consumer, RESUME_CHECK_RETRIES)
+                    )
                 else:
                     consumer.add_task_queue(self.queue_name)
         # Use call_soon to ensure thread safety

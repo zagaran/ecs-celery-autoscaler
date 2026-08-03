@@ -87,6 +87,7 @@ class EcsCeleryAutoscaler:
         self.protection_expires_minutes = protection_expires_minutes
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
+        self.metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
@@ -98,11 +99,17 @@ class EcsCeleryAutoscaler:
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
         if not self.enabled:
-            log.warning("AUTOSCALING_ENABLED is false — %s autoscaler is disabled", self.ecs_service)
+            log.warning("AUTOSCALING_ENABLED is false — %s will not use ECSCeleryAutoscaler", self.ecs_service)
             return
         if not self.agent_uri:
             log.error(
                 "ECS_AGENT_URI is not set — %s will not use ECSCeleryAutoscaler",
+                self.ecs_service,
+            )
+            return
+        if not self.metadata_uri:
+            log.warning(
+                "ECS_CONTAINER_METADATA_URI_V4 is not set — %s will not use ECSCeleryAutoscaler",
                 self.ecs_service,
             )
             return
@@ -256,11 +263,14 @@ class EcsCeleryAutoscaler:
             if self._shutting_down.is_set():
                 return
             consumer = self._consumer
-            if consumer is None:
-                # No task has been received yet, so there's nothing consumer-owned to race against.
-                self._protection_tick()
-            else:
-                consumer.call_soon(self._protection_tick)
+            try:
+                if consumer is None:
+                    # No task has been received yet, so there's nothing consumer-owned to race against.
+                    self._protection_tick()
+                else:
+                    consumer.call_soon(self._protection_tick)
+            except Exception:
+                log.exception("failed to schedule protection tick for %s", self.ecs_service)
 
     def _protection_tick(self) -> None:
         """Renews protection while busy, under `_protection_lock` so it can't race `_on_shutdown`'s
@@ -291,10 +301,10 @@ class EcsCeleryAutoscaler:
         return False
 
     def _task_desired_status(self) -> str | None:
-        """Reads this task's own DesiredStatus from the ECS task metadata endpoint. Returns None
-        (inconclusive, not evidence either way) if the check can't be completed."""
+        """Reads this task's own DesiredStatus from the ECS task metadata endpoint — `metadata_uri`,
+        Returns None (inconclusive, not evidence either way) if the check can't be completed."""
         try:
-            with urllib.request.urlopen(f"{self.agent_uri}/task", timeout=5) as resp:
+            with urllib.request.urlopen(f"{self.metadata_uri}/task", timeout=5) as resp:
                 parsed = json.loads(resp.read())
         except Exception:
             log.exception("failed to check task status for %s", self.ecs_service)

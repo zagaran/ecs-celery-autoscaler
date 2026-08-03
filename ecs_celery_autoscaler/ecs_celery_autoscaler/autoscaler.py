@@ -104,7 +104,7 @@ class EcsCeleryAutoscaler:
         if not self.agent_uri:
             log.error(
                 "ECS_AGENT_URI is not set — %s will not use ECSCeleryAutoscaler",
-                ecs_service,
+                self.ecs_service,
             )
             return
         after_task_publish.connect(self._on_publish, weak=False)
@@ -304,8 +304,11 @@ class EcsCeleryAutoscaler:
         threading.Thread(target=self._check_status_then_decide, args=(consumer, attempts_left), daemon=True).start()
 
     def _check_status_then_decide(self, consumer, attempts_left: int) -> None:
-        status = self._task_desired_status()
-        consumer.call_soon(self._decide_resume, consumer, attempts_left, status)
+        try:
+            status = self._task_desired_status()
+            consumer.call_soon(self._decide_resume, consumer, attempts_left, status)
+        except Exception:
+            log.exception("failed to schedule resume decision for %s", self.ecs_service)
 
     def _decide_resume(self, consumer, attempts_left: int, status: str | None) -> None:
         """Retries up to `RESUME_CHECK_RETRIES` times, `RESUME_CHECK_INTERVAL` apart, until STOPPED

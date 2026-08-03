@@ -171,18 +171,22 @@ class EcsCeleryAutoscaler:
         try:
             with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
                 queue_len = self.redis_client.llen(self.queue_name)
-                pending = self._pending_count()
+                pending, busy_workers = self._pending_and_busy_workers()
                 outstanding = queue_len + pending
-                target = self._target_worker_count(outstanding)
+                # Never target fewer workers than are currently busy: a busy worker's task can't be
+                # moved to another container, so asking ECS to scale below that just gets the
+                # deployment blocked by scale-in protection until the task finishes on its own.
+                target = max(busy_workers, self._target_worker_count(outstanding))
                 current = self._desired_count()
                 if target != current:
                     self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
                     log.info(
-                        "reconciled %s to desiredCount=%d (queue_len=%d, pending=%d)",
+                        "reconciled %s to desiredCount=%d (queue_len=%d, pending=%d, busy_workers=%d)",
                         self.ecs_service,
                         target,
                         queue_len,
                         pending,
+                        busy_workers,
                     )
         except Exception:
             log.exception("reconcile failed for %s", self.ecs_service)
@@ -190,17 +194,19 @@ class EcsCeleryAutoscaler:
     def _target_worker_count(self, outstanding: int) -> int:
         return min(self.max_workers, max(self.min_workers, math.ceil(outstanding / self.tasks_per_worker)))
 
-    def _pending_count(self) -> int:
-        """Cluster-wide count of tasks for this queue that are received but not finished, read live
-        via Celery's control plane. A worker that misses the inspect timeout just isn't counted this
-        pass and gets picked up on the next one."""
+    def _pending_and_busy_workers(self) -> tuple[int, int]:
+        """Cluster-wide count of tasks for this queue that are received but not finished, plus how
+        many distinct workers reported at least one, read live via Celery's control plane. A worker
+        that misses the inspect timeout just isn't counted this pass and gets picked up on the next
+        one."""
         replies = self.celery_app.control.broadcast(
             OUTSTANDING_COMMAND,
             arguments={"queue_name": self.queue_name},
             reply=True,
             timeout=INSPECT_TIMEOUT,
         )
-        return sum(flatten_reply(replies or []).values())
+        counts = flatten_reply(replies or []).values()
+        return sum(counts), sum(1 for count in counts if count > 0)
 
     def _desired_count(self) -> int:
         resp = self._ecs.describe_services(cluster=self.ecs_cluster, services=[self.ecs_service])

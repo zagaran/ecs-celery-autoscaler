@@ -121,7 +121,7 @@ class EcsCeleryAutoscaler:
 
     def _on_publish(self, sender=None, routing_key=None, **kwargs):
         if routing_key == self.queue_name:
-            self.scale_up()
+            threading.Thread(target=self.scale_up, daemon=True).start()
 
     def _on_received(self, sender=None, request=None, **kwargs):
         """Fires the instant a task is delivered, before it necessarily has a pool slot or is even

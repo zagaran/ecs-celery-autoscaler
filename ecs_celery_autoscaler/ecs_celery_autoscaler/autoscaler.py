@@ -315,9 +315,11 @@ class EcsCeleryAutoscaler:
             log.exception("failed to schedule resume decision for %s", self.ecs_service)
 
     def _decide_resume(self, consumer, attempts_left: int, status: str | None) -> None:
-        """Retries up to `RESUME_CHECK_RETRIES` times, `RESUME_CHECK_INTERVAL` apart, then resumes
-        unconditionally once attempts run out, since an orphaned consumer is worse than reopening
-        this race. Bails early if `_shutting_down` is set or ECS already marked the task STOPPED."""
+        """The ECS agent is responsible for marking this task as STOPPED, but there is no definitive
+        schedule for when it does this. Therefore, check a few times over the course of RESUME_CHECK_INTERVAL
+        in order to give the ECS agent time. If we reach the end of the interval and the task is still
+        RUNNING then assume the ECS agent decided to keep this task and re-connect the queue so the task
+        can receive jobs again."""
         if self._shutting_down.is_set():
             return
         if status == "STOPPED":

@@ -39,6 +39,7 @@ In Django you can enable these settings with
 
 ```python
 from ecs_celery_autoscaler import EcsCeleryAutoscaler
+import redis
 
 scaler = EcsCeleryAutoscaler(
     celery_app=app,

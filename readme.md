@@ -52,7 +52,7 @@ scaler = EcsCeleryAutoscaler(
     max_workers=1,
     protection_expires_minutes=60,
     scale_in_cooldown_seconds=60,
-    metric=QueueDepthMetric(tasks_per_worker=1),
+    metric=QueueDepthMetric(tasks_per_worker=2),
 )
 
 scaler.install()

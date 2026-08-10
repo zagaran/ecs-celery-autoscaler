@@ -253,6 +253,10 @@ class EcsCeleryAutoscaler:
         if request is not None and request.delivery_info.get("routing_key") == self.queue_name:
             with self._protection_lock:
                 self._set_protection(True)
+                # A task that finishes before the next `_protection_tick` would otherwise never be
+                # observed as busy, so its busy-to-idle transition (and thus protection release)
+                # would never fire.
+                self._was_busy = True
             self.metric.on_task_received(request)
 
     def _on_postrun(self, task_id=None, **kwargs):

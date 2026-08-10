@@ -279,12 +279,13 @@ class EcsCeleryAutoscaler:
         else:
             consumer.call_soon(_release_protection_wrapper)
 
-    def maybe_scale_service(self) -> None:
+    def maybe_scale_service(self) -> bool:
         """Recomputes the target worker count and scales toward it. Safe even mid-task, since ECS
         scale-in protection guarantees a busy container is never terminated regardless of
-        desiredCount."""
+        desiredCount. Returns whether this call just reduced desiredCount, so callers stepping a
+        ratcheting metric down know whether another step down might still be needed."""
         if not self.enabled:
-            return
+            return False
         try:
             with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
                 current = self._desired_count()
@@ -306,8 +307,10 @@ class EcsCeleryAutoscaler:
                         busy_workers,
                         ", ".join(f"{k}={v}" for k, v in log_extra.items()),
                     )
+                return target < current
         except Exception:
             log.exception("Autoscaling failed for %s", self.ecs_service)
+            return False
 
     def _scale_in_allowed(self) -> bool:
         """Cluster-wide cooldown gate: blocked as long as any worker has been busy within the last
@@ -409,10 +412,19 @@ class EcsCeleryAutoscaler:
                     self._release_protection_resumable()
                 # Nothing else re-checks scale-in once the cooldown set above blocks it, so schedule
                 # a retry for when this task's own cooldown window elapses.
-                threading.Timer(self.scale_in_cooldown_seconds, self.maybe_scale_service).start()
+                threading.Timer(self.scale_in_cooldown_seconds, self._retry_scale_in).start()
             self._was_busy = busy
         except Exception:
             log.exception("protection poll failed for %s", self.ecs_service)
+
+    def _retry_scale_in(self) -> None:
+        """Re-runs `maybe_scale_service` and, if it just stepped desiredCount down, schedules
+        another retry after another cooldown window — needed for a ratcheting metric (e.g.
+        `QueueLatencyMetric`) that only ever asks to go down by one worker per evaluation, since
+        nothing else re-evaluates it while the fleet stays idle. Self-terminates once a call makes
+        no further reduction (target reached, or a new task arrived and became busy again)."""
+        if self.maybe_scale_service():
+            threading.Timer(self.scale_in_cooldown_seconds, self._retry_scale_in).start()
 
     def _task_desired_status(self) -> str | None:
         """Reads this task's own DesiredStatus from the ECS task metadata endpoint. Returns None

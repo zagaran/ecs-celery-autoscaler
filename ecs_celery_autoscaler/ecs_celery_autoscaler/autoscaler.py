@@ -101,16 +101,13 @@ class QueueLatencyMetric(ScalingMetric):
         self,
         threshold_seconds: float,
         window_seconds: int = 300,
-        scale_in_cooldown_seconds: int = 300,
     ):
         self.threshold_seconds = threshold_seconds
         self.window_seconds = window_seconds
-        self.scale_in_cooldown_seconds = scale_in_cooldown_seconds
 
     def bind(self, autoscaler: EcsCeleryAutoscaler) -> None:
         super().bind(autoscaler)
         self._latency_key = f"ecs-celery-autoscaler:{autoscaler.ecs_service}:queue-latency-samples"
-        self._cooldown_key = f"ecs-celery-autoscaler:{autoscaler.ecs_service}:queue-latency-scale-in-cooldown"
         before_task_publish.connect(self._on_before_publish, weak=False)
 
     def _on_before_publish(self, sender=None, headers=None, routing_key=None, **kwargs):
@@ -144,12 +141,6 @@ class QueueLatencyMetric(ScalingMetric):
             return None
         return max(float((m.decode() if isinstance(m, bytes) else m).split(":", 1)[0]) for m in members)
 
-    def _scale_in_allowed(self) -> bool:
-        """Atomic cluster-wide cooldown gate: only the first caller within a window may scale in."""
-        return bool(
-            self.redis_client.set(self._cooldown_key, "1", ex=self.scale_in_cooldown_seconds, nx=True)
-        )
-
     def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
         latency = self._current_latency()
         log_extra = {"queue_latency": f"{latency:.2f}s" if latency is not None else "n/a"}
@@ -157,9 +148,7 @@ class QueueLatencyMetric(ScalingMetric):
             return current, log_extra
         if latency > self.threshold_seconds:
             return current + 1, log_extra
-        if self._scale_in_allowed():
-            return current - 1, log_extra
-        return current, log_extra
+        return current - 1, log_extra
 
 
 class EcsCeleryAutoscaler:
@@ -180,6 +169,7 @@ class EcsCeleryAutoscaler:
         min_workers: int = 0,
         max_workers: int = 1,
         protection_expires_minutes: int = 60,
+        scale_in_cooldown_seconds: int = 60,
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
@@ -191,12 +181,14 @@ class EcsCeleryAutoscaler:
         self.min_workers = min_workers
         self.max_workers = max_workers
         self.protection_expires_minutes = protection_expires_minutes
+        self.scale_in_cooldown_seconds = scale_in_cooldown_seconds
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
         self.metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
+        self._scale_in_cooldown_key = f"ecs-celery-autoscaler:{self.ecs_service}:scale-in-cooldown"
         self._consumer = None
         self._protection_lock = threading.Lock()
         self._shutting_down = threading.Event()
@@ -297,6 +289,8 @@ class EcsCeleryAutoscaler:
                 # moved to another container, so asking ECS to scale below that just gets the
                 # deployment blocked by scale-in protection until the task finishes on its own.
                 target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
+                if target < current and not self._scale_in_allowed():
+                    target = current
                 if target != current:
                     self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
                     log.info(
@@ -309,6 +303,12 @@ class EcsCeleryAutoscaler:
                     )
         except Exception:
             log.exception("Autoscaling failed for %s", self.ecs_service)
+
+    def _scale_in_allowed(self) -> bool:
+        """Atomic cluster-wide cooldown gate: only the first caller within a window may scale in."""
+        return bool(
+            self.redis_client.set(self._scale_in_cooldown_key, "1", ex=self.scale_in_cooldown_seconds, nx=True)
+        )
 
     def _pending_and_busy_workers(self) -> tuple[int, int]:
         """Cluster-wide count of tasks for this queue that are received but not finished, plus how

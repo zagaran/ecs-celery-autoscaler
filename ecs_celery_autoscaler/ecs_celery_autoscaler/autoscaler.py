@@ -73,7 +73,7 @@ class ScalingMetric(abc.ABC):
     @abc.abstractmethod
     def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
         """Returns (raw target worker count, extra fields for the scale-event log), before the caller
-        applies the busy-worker floor and min/max clamp."""
+        applies the min/max clamp."""
 
     def on_task_received(self, request) -> None:
         """Optional hook fired from `_on_received` after scale-in protection is set; no-op by default."""
@@ -169,7 +169,6 @@ class EcsCeleryAutoscaler:
         min_workers: int = 0,
         max_workers: int = 1,
         protection_expires_minutes: int = 60,
-        scale_in_cooldown_seconds: int = 60,
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
@@ -181,16 +180,12 @@ class EcsCeleryAutoscaler:
         self.min_workers = min_workers
         self.max_workers = max_workers
         self.protection_expires_minutes = protection_expires_minutes
-        self.scale_in_cooldown_seconds = scale_in_cooldown_seconds
         self.enabled = os.environ.get("AUTOSCALING_ENABLED", "True") not in ("FALSE", "False", "false")
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
         self.metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
-        # Existence of this key means "some worker was busy within the last scale_in_cooldown_seconds";
-        # its TTL is refreshed for as long as that stays true.
-        self._scale_in_cooldown_key = f"ecs-celery-autoscaler:{self.ecs_service}:scale-in-cooldown"
         self._consumer = None
         self._protection_lock = threading.Lock()
         self._shutting_down = threading.Event()
@@ -251,9 +246,6 @@ class EcsCeleryAutoscaler:
                 # observed as busy, so its busy-to-idle transition (and thus protection release)
                 # would never fire.
                 self._was_busy = True
-            # Set here (not just from `_protection_tick`) so a task shorter than
-            # PROTECTION_POLL_INTERVAL still starts the cooldown window.
-            self._extend_scale_in_cooldown()
             self.metric.on_task_received(request)
 
     def _on_postrun(self, task_id=None, **kwargs):
@@ -279,24 +271,19 @@ class EcsCeleryAutoscaler:
         else:
             consumer.call_soon(_release_protection_wrapper)
 
-    def maybe_scale_service(self) -> bool:
+    def maybe_scale_service(self) -> None:
         """Recomputes the target worker count and scales toward it. Safe even mid-task, since ECS
         scale-in protection guarantees a busy container is never terminated regardless of
-        desiredCount. Returns whether this call just reduced desiredCount, so callers stepping a
-        ratcheting metric down know whether another step down might still be needed."""
+        desiredCount — a target below the number of currently busy workers just leaves the
+        deployment blocked until enough of them finish on their own."""
         if not self.enabled:
-            return False
+            return
         try:
             with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
                 current = self._desired_count()
                 pending, busy_workers = self._pending_and_busy_workers()
                 raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
-                # Never target fewer workers than are currently busy: a busy worker's task can't be
-                # moved to another container, so asking ECS to scale below that just gets the
-                # deployment blocked by scale-in protection until the task finishes on its own.
-                target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
-                if target < current and not self._scale_in_allowed():
-                    target = current
+                target = min(self.max_workers, max(self.min_workers, raw_target))
                 if target != current:
                     self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
                     log.info(
@@ -307,21 +294,8 @@ class EcsCeleryAutoscaler:
                         busy_workers,
                         ", ".join(f"{k}={v}" for k, v in log_extra.items()),
                     )
-                return target < current
         except Exception:
             log.exception("Autoscaling failed for %s", self.ecs_service)
-            return False
-
-    def _scale_in_allowed(self) -> bool:
-        """Cluster-wide cooldown gate: blocked as long as any worker has been busy within the last
-        `scale_in_cooldown_seconds`, regardless of which container observes that busy state."""
-        return not self.redis_client.exists(self._scale_in_cooldown_key)
-
-    def _extend_scale_in_cooldown(self) -> None:
-        """Marks the cluster as busy for `scale_in_cooldown_seconds`, restarting the cooldown clock.
-        Call this whenever a container is confirmed busy, not just once at scale-in time — otherwise
-        the window measures time since the last scale-in attempt instead of time since work stopped."""
-        self.redis_client.set(self._scale_in_cooldown_key, "1", ex=self.scale_in_cooldown_seconds)
 
     def _pending_and_busy_workers(self) -> tuple[int, int]:
         """Cluster-wide count of tasks for this queue that are received but not finished, plus how
@@ -401,7 +375,6 @@ class EcsCeleryAutoscaler:
             busy = self._is_busy()
             shutting_down = self._shutting_down.is_set()
             if busy:
-                self._extend_scale_in_cooldown()
                 with self._protection_lock:
                     if not shutting_down:
                         self._set_protection(True)
@@ -410,21 +383,9 @@ class EcsCeleryAutoscaler:
                     self._release_protection_terminal(self._consumer)
                 else:
                     self._release_protection_resumable()
-                # Nothing else re-checks scale-in once the cooldown set above blocks it, so schedule
-                # a retry for when this task's own cooldown window elapses.
-                threading.Timer(self.scale_in_cooldown_seconds, self._retry_scale_in).start()
             self._was_busy = busy
         except Exception:
             log.exception("protection poll failed for %s", self.ecs_service)
-
-    def _retry_scale_in(self) -> None:
-        """Re-runs `maybe_scale_service` and, if it just stepped desiredCount down, schedules
-        another retry after another cooldown window — needed for a ratcheting metric (e.g.
-        `QueueLatencyMetric`) that only ever asks to go down by one worker per evaluation, since
-        nothing else re-evaluates it while the fleet stays idle. Self-terminates once a call makes
-        no further reduction (target reached, or a new task arrived and became busy again)."""
-        if self.maybe_scale_service():
-            threading.Timer(self.scale_in_cooldown_seconds, self._retry_scale_in).start()
 
     def _task_desired_status(self) -> str | None:
         """Reads this task's own DesiredStatus from the ECS task metadata endpoint. Returns None

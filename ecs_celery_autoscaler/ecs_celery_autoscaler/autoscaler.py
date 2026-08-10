@@ -188,6 +188,8 @@ class EcsCeleryAutoscaler:
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
+        # Existence of this key means "some worker was busy within the last scale_in_cooldown_seconds";
+        # its TTL is refreshed for as long as that stays true.
         self._scale_in_cooldown_key = f"ecs-celery-autoscaler:{self.ecs_service}:scale-in-cooldown"
         self._consumer = None
         self._protection_lock = threading.Lock()
@@ -249,6 +251,9 @@ class EcsCeleryAutoscaler:
                 # observed as busy, so its busy-to-idle transition (and thus protection release)
                 # would never fire.
                 self._was_busy = True
+            # Set here (not just from `_protection_tick`) so a task shorter than
+            # PROTECTION_POLL_INTERVAL still starts the cooldown window.
+            self._extend_scale_in_cooldown()
             self.metric.on_task_received(request)
 
     def _on_postrun(self, task_id=None, **kwargs):
@@ -305,10 +310,15 @@ class EcsCeleryAutoscaler:
             log.exception("Autoscaling failed for %s", self.ecs_service)
 
     def _scale_in_allowed(self) -> bool:
-        """Atomic cluster-wide cooldown gate: only the first caller within a window may scale in."""
-        return bool(
-            self.redis_client.set(self._scale_in_cooldown_key, "1", ex=self.scale_in_cooldown_seconds, nx=True)
-        )
+        """Cluster-wide cooldown gate: blocked as long as any worker has been busy within the last
+        `scale_in_cooldown_seconds`, regardless of which container observes that busy state."""
+        return not self.redis_client.exists(self._scale_in_cooldown_key)
+
+    def _extend_scale_in_cooldown(self) -> None:
+        """Marks the cluster as busy for `scale_in_cooldown_seconds`, restarting the cooldown clock.
+        Call this whenever a container is confirmed busy, not just once at scale-in time — otherwise
+        the window measures time since the last scale-in attempt instead of time since work stopped."""
+        self.redis_client.set(self._scale_in_cooldown_key, "1", ex=self.scale_in_cooldown_seconds)
 
     def _pending_and_busy_workers(self) -> tuple[int, int]:
         """Cluster-wide count of tasks for this queue that are received but not finished, plus how
@@ -388,6 +398,7 @@ class EcsCeleryAutoscaler:
             busy = self._is_busy()
             shutting_down = self._shutting_down.is_set()
             if busy:
+                self._extend_scale_in_cooldown()
                 with self._protection_lock:
                     if not shutting_down:
                         self._set_protection(True)
@@ -396,6 +407,9 @@ class EcsCeleryAutoscaler:
                     self._release_protection_terminal(self._consumer)
                 else:
                     self._release_protection_resumable()
+                # Nothing else re-checks scale-in once the cooldown set above blocks it, so schedule
+                # a retry for when this task's own cooldown window elapses.
+                threading.Timer(self.scale_in_cooldown_seconds, self.maybe_scale_service).start()
             self._was_busy = busy
         except Exception:
             log.exception("protection poll failed for %s", self.ecs_service)

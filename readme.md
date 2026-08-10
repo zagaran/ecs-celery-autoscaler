@@ -72,8 +72,8 @@ scaler.install()
     and this metric silently holds the worker count steady forever.
   - To define your own, subclass `ScalingMetric` and implement
     `target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]`.
-- `scale_in_cooldown_seconds`: minimum time between reductions in `desiredCount`. Prevents flapping down and back up right after a burst. Defaults to `60`; set to `0`
-  to scale in as soon as a metric asks for it.
+- `scale_in_cooldown_seconds`: how long a worker must sit idle before `desiredCount` is reduced. Prevents flapping down and back up right after a burst. Defaults to `60`;
+  set to `0` to scale in as soon as a metric asks for it.
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
   renewed (this library renews automatically in the background for tasks that run longer than this).
   Set this to at least your longest anticipated task duration. ECS can refuse renewal calls while a

@@ -38,7 +38,7 @@ In Django you can enable these settings with
    whichever module defines your Celery `app`
 
 ```python
-from ecs_celery_autoscaler import EcsCeleryAutoscaler
+from ecs_celery_autoscaler import EcsCeleryAutoscaler, QueueDepthMetric
 import redis
 
 scaler = EcsCeleryAutoscaler(
@@ -50,16 +50,21 @@ scaler = EcsCeleryAutoscaler(
     queue_name="celery",
     min_workers=0,
     max_workers=1,
-    tasks_per_worker=1,
     protection_expires_minutes=60,
+    metric=QueueDepthMetric(tasks_per_worker=2),
 )
 
 scaler.install()
 ```
 
 - `min_workers` / `max_workers`: the range `desiredCount` is scaled within. Defaults (`0`/`1`)
-- `tasks_per_worker`: maximum number of tasks for each celery worker to process. It is recommended to set this 
-  to be the number of processes your workers have. Your service will be scaled to `pending_tasks / tasks_per_worker`
+- `metric`: the `ScalingMetric` that decides the target worker count every time the autoscaler recomputes it.
+  Built-in options:
+  - `QueueDepthMetric(tasks_per_worker=1)`: scales to `ceil(outstanding_tasks / tasks_per_worker)`, where
+    `outstanding_tasks` is the broker queue length plus in-flight tasks. Set `tasks_per_worker` to the number
+    of worker processes each ECS task runs.
+  - To define your own, subclass `ScalingMetric` and implement
+    `target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]`.
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
   renewed (this library renews automatically in the background for tasks that run longer than this).
   Set this to at least your longest anticipated task duration. ECS can refuse renewal calls while a
@@ -74,10 +79,10 @@ scaler.install()
 # How Does it Work?
 This library utilizes Celery's signals along with redis statistics to track queue depth and each worker's processing state.
 
-**How many workers:** on every task publish and task completion, the target worker count is recomputed to be
-`ceil(outstanding_tasks / tasks_per_worker)`, limited by `[min_workers, max_workers]`. The ECS service is then 
-scaled up/down if the target count differs from the current count. Note that an ECS task will not be terminated 
-if it is still processing a task.
+**How many workers:** on every task publish and task completion, the target worker count is recomputed by the
+configured `metric` (see `metric` above), then clamped to `[min_workers, max_workers]` and to never go below the
+number of currently busy workers. The ECS service is then scaled up/down if the target count differs from the
+current count.
 
 **Which worker is safe to remove:** Whenever a worker picks up a task it marks it as protected from scale-in via 
 ECS Task Protection. On task completion, it removes the protection.

@@ -95,14 +95,26 @@ class QueueLatencyMetric(ScalingMetric):
     """Scales by ratcheting the current worker count based on how long tasks wait in the queue before
     being received, measured by diffing a publish-time timestamp stamped into the task headers. Every
     process that calls `install()` must use this same metric, including producers, or no timestamps
-    get stamped and this metric silently holds `current` forever."""
+    get stamped and this metric silently holds `current` forever. With zero workers running there's
+    also no consumer to ever measure a wait with, so `target_worker_count` falls back to bootstrapping
+    one worker off the raw broker queue length in that specific case; every other decision is latency-
+    based.
+
+    `scale_up_threshold_seconds` and `scale_down_threshold_seconds` form a dead band: latency between
+    them holds the current count steady. A single threshold would mean every evaluation with fresh
+    latency data commands a +1 or -1 move with no resting point, so even a workload perfectly matched
+    to its current worker count would ratchet down, overshoot, and correct back up forever."""
 
     def __init__(
         self,
-        threshold_seconds: float,
+        scale_up_threshold_seconds: float = 10.0,
+        scale_down_threshold_seconds: float = 1.0,
         window_seconds: int = 300,
     ):
-        self.threshold_seconds = threshold_seconds
+        if scale_down_threshold_seconds >= scale_up_threshold_seconds:
+            raise ValueError("scale_down_threshold_seconds must be less than scale_up_threshold_seconds")
+        self.scale_up_threshold_seconds = scale_up_threshold_seconds
+        self.scale_down_threshold_seconds = scale_down_threshold_seconds
         self.window_seconds = window_seconds
 
     def bind(self, autoscaler: EcsCeleryAutoscaler) -> None:
@@ -145,10 +157,18 @@ class QueueLatencyMetric(ScalingMetric):
         latency = self._current_latency()
         log_extra = {"queue_latency": f"{latency:.2f}s" if latency is not None else "n/a"}
         if latency is None:
+            if current == 0:
+                # Handle when scaled to 0 and therefore have no latency data.
+                # Bootstrap one worker off the raw broker queue length —
+                # once it's running, its own observations take over from the next evaluation on.
+                queue_len = self.redis_client.llen(self.autoscaler.queue_name)
+                return (1 if queue_len > 0 else 0), log_extra
             return current, log_extra
-        if latency > self.threshold_seconds:
+        if latency > self.scale_up_threshold_seconds:
             return current + 1, log_extra
-        return current - 1, log_extra
+        if latency < self.scale_down_threshold_seconds:
+            return current - 1, log_extra
+        return current, log_extra
 
 
 class EcsCeleryAutoscaler:

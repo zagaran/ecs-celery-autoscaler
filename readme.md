@@ -92,11 +92,9 @@ scaler.install()
 This library utilizes Celery's signals along with redis statistics to track queue depth and each worker's processing state.
 
 **How many workers:** on every task publish and task completion, the target worker count is recomputed by the
-configured `metric` (see `metric` above), then clamped to `[min_workers, max_workers]`. The ECS service is then
-scaled up/down if the target count differs from the current count. If the target is below the number of
-currently busy workers, the request still goes through immediately — ECS will not terminate a task that is
-still processing a job, so the deployment just holds at the busy count until enough workers finish on their
-own to converge.
+configured `metric` (see `metric` above), then clamped to `[min_workers, max_workers]` and to never go below the
+number of currently busy workers. The ECS service is then scaled up/down if the target count differs from the
+current count.
 
 **Which worker is safe to remove:** Whenever a worker picks up a task it marks it as protected from scale-in via 
 ECS Task Protection. On task completion, it removes the protection.

@@ -262,9 +262,8 @@ class EcsCeleryAutoscaler:
         if request is not None and request.delivery_info.get("routing_key") == self.queue_name:
             with self._protection_lock:
                 self._set_protection(True)
-                # A task that finishes before the next `_protection_tick` would otherwise never be
-                # observed as busy, so its busy-to-idle transition (and thus protection release)
-                # would never fire.
+                # Manually mark this process as busy. A task that finishes very quickly, i.e. before the
+                # next protection_tick, would never otherwise set _was_busy correctly.
                 self._was_busy = True
             self.metric.on_task_received(request)
 
@@ -303,7 +302,8 @@ class EcsCeleryAutoscaler:
                 current = self._desired_count()
                 pending, busy_workers = self._pending_and_busy_workers()
                 raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
-                target = min(self.max_workers, max(self.min_workers, raw_target))
+                # Never target fewer workers than are currently busy
+                target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
                 if target != current:
                     self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
                     log.info(

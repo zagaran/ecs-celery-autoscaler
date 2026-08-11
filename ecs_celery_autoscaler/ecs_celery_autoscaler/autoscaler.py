@@ -212,8 +212,7 @@ class EcsCeleryAutoscaler:
     def maybe_scale_service(self) -> None:
         """Recomputes the target worker count and scales toward it. Safe even mid-task, since ECS
         scale-in protection guarantees a busy container is never terminated regardless of
-        desiredCount — a target below the number of currently busy workers just leaves the
-        deployment blocked until enough of them finish on their own."""
+        desiredCount."""
         if not self.enabled:
             return
         try:
@@ -221,7 +220,8 @@ class EcsCeleryAutoscaler:
                 current = self._desired_count()
                 pending, busy_workers = self._pending_and_busy_workers()
                 raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
-                target = min(self.max_workers, max(self.min_workers, raw_target))
+                # Never target fewer workers than are currently busy
+                target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
                 if target != current:
                     self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
                     log.info(

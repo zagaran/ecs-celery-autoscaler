@@ -1,3 +1,3 @@
-from .autoscaler import EcsCeleryAutoscaler, QueueDepthMetric, QueueLatencyMetric, ScalingMetric
+from .autoscaler import EcsCeleryAutoscaler, QueueDepthMetric, ScalingMetric
 
-__all__ = ["EcsCeleryAutoscaler", "QueueDepthMetric", "QueueLatencyMetric", "ScalingMetric"]
+__all__ = ["EcsCeleryAutoscaler", "QueueDepthMetric", "ScalingMetric"]

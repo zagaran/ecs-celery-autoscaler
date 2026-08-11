@@ -15,7 +15,6 @@ import boto3
 from celery.app.control import flatten_reply
 from celery.signals import (
     after_task_publish,
-    before_task_publish,
     task_postrun,
     task_received,
     worker_shutting_down,
@@ -33,7 +32,6 @@ RESUME_CHECK_RETRIES = 6
 RESUME_CHECK_INTERVAL = 15
 INSPECT_TIMEOUT = 1.0
 OUTSTANDING_COMMAND = "ecs_celery_autoscaler_outstanding"
-PUBLISHED_AT_HEADER = "ecs_celery_autoscaler_published_at"
 
 
 def _matches_queue(request, queue_name) -> bool:
@@ -89,86 +87,6 @@ class QueueDepthMetric(ScalingMetric):
         queue_len = self.redis_client.llen(self.autoscaler.queue_name)
         outstanding = queue_len + pending
         return math.ceil(outstanding / self.tasks_per_worker), {"queue_len": queue_len}
-
-
-class QueueLatencyMetric(ScalingMetric):
-    """Scales by ratcheting the current worker count based on how long tasks wait in the queue before
-    being received, measured by diffing a publish-time timestamp stamped into the task headers. Every
-    process that calls `install()` must use this same metric, including producers, or no timestamps
-    get stamped and this metric silently holds `current` forever. With zero workers running there's
-    also no consumer to ever measure a wait with, so `target_worker_count` falls back to bootstrapping
-    one worker off the raw broker queue length in that specific case; every other decision is latency-
-    based.
-
-    `scale_up_threshold_seconds` and `scale_down_threshold_seconds` form a dead band: latency between
-    them holds the current count steady. A single threshold would mean every evaluation with fresh
-    latency data commands a +1 or -1 move with no resting point, so even a workload perfectly matched
-    to its current worker count would ratchet down, overshoot, and correct back up forever."""
-
-    def __init__(
-        self,
-        scale_up_threshold_seconds: float = 10.0,
-        scale_down_threshold_seconds: float = 1.0,
-        window_seconds: int = 300,
-    ):
-        if scale_down_threshold_seconds >= scale_up_threshold_seconds:
-            raise ValueError("scale_down_threshold_seconds must be less than scale_up_threshold_seconds")
-        self.scale_up_threshold_seconds = scale_up_threshold_seconds
-        self.scale_down_threshold_seconds = scale_down_threshold_seconds
-        self.window_seconds = window_seconds
-
-    def bind(self, autoscaler: EcsCeleryAutoscaler) -> None:
-        super().bind(autoscaler)
-        self._latency_key = f"ecs-celery-autoscaler:{autoscaler.ecs_service}:queue-latency-samples"
-        before_task_publish.connect(self._on_before_publish, weak=False)
-
-    def _on_before_publish(self, sender=None, headers=None, routing_key=None, **kwargs):
-        if routing_key == self.autoscaler.queue_name and headers is not None:
-            headers[PUBLISHED_AT_HEADER] = time.time()
-
-    def on_task_received(self, request) -> None:
-        """Records this task's queue wait as a sample, skipping delayed tasks (eta/countdown/backoff
-        retries) since their wait is intentional, not backlog."""
-        if request.eta is not None:
-            return
-        published_at = request.message.headers.get(PUBLISHED_AT_HEADER)
-        if published_at is None:
-            return
-        try:
-            wait = max(0.0, time.time() - float(published_at))
-            member = f"{wait:.4f}:{uuid.uuid4().hex[:8]}"
-            with self.redis_client.pipeline() as pipe:
-                pipe.zadd(self._latency_key, {member: time.time()})
-                pipe.expire(self._latency_key, self.window_seconds * 2)
-                pipe.execute()
-        except Exception:
-            log.exception("failed to record queue latency sample for %s", self.autoscaler.ecs_service)
-
-    def _current_latency(self) -> float | None:
-        """Returns the max sample recorded within `window_seconds`, pruning older ones first."""
-        redis_client = self.redis_client
-        redis_client.zremrangebyscore(self._latency_key, "-inf", time.time() - self.window_seconds)
-        members = redis_client.zrange(self._latency_key, 0, -1)
-        if not members:
-            return None
-        return max(float((m.decode() if isinstance(m, bytes) else m).split(":", 1)[0]) for m in members)
-
-    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
-        latency = self._current_latency()
-        log_extra = {"queue_latency": f"{latency:.2f}s" if latency is not None else "n/a"}
-        if latency is None:
-            if current == 0:
-                # Handle when scaled to 0 and therefore have no latency data.
-                # Bootstrap one worker off the raw broker queue length —
-                # once it's running, its own observations take over from the next evaluation on.
-                queue_len = self.redis_client.llen(self.autoscaler.queue_name)
-                return (1 if queue_len > 0 else 0), log_extra
-            return current, log_extra
-        if latency > self.scale_up_threshold_seconds:
-            return current + 1, log_extra
-        if latency < self.scale_down_threshold_seconds:
-            return current - 1, log_extra
-        return current, log_extra
 
 
 class EcsCeleryAutoscaler:

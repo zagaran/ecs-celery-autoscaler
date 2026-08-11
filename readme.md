@@ -63,18 +63,6 @@ scaler.install()
   - `QueueDepthMetric(tasks_per_worker=1)`: scales to `ceil(outstanding_tasks / tasks_per_worker)`, where
     `outstanding_tasks` is the broker queue length plus in-flight tasks. Set `tasks_per_worker` to the number
     of worker processes each ECS task runs.
-  - `QueueLatencyMetric(scale_up_threshold_seconds, scale_down_threshold_seconds, window_seconds=300)`:
-    instead of reacting to queue length, scales by one worker at a time based on how long tasks are
-    waiting to be picked up. Scales up by 1 if any task has waited longer than `scale_up_threshold_seconds`
-    within the last `window_seconds`; scales down by 1 if the longest wait in that window is under
-    `scale_down_threshold_seconds`; otherwise holds steady. The gap between the two thresholds is a dead
-    band — without it, a workload perfectly matched to its current worker count would still ratchet down
-    and get corrected back up on every evaluation, since a single threshold has no resting point. Every
-    process that calls `.install()` — including producers that never consume tasks — must use this same
-    metric, or publish timestamps never get stamped and this metric silently holds the worker count steady
-    forever. With zero workers running there's nothing to measure a wait with either; in that case it
-    bootstraps one worker if the broker queue isn't empty, and hands off to normal latency-based scaling
-    from there.
   - To define your own, subclass `ScalingMetric` and implement
     `target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]`.
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be

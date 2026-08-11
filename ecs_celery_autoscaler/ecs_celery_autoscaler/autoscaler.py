@@ -13,12 +13,7 @@ from typing import Any
 
 import boto3
 from celery.app.control import flatten_reply
-from celery.signals import (
-    after_task_publish,
-    task_postrun,
-    task_received,
-    worker_shutting_down,
-)
+from celery.signals import after_task_publish, task_postrun, task_received, worker_shutting_down
 from celery.worker import state as worker_state
 from celery.worker.control import inspect_command
 from celery.worker.request import Request as WorkerRequest
@@ -180,9 +175,8 @@ class EcsCeleryAutoscaler:
         if request is not None and request.delivery_info.get("routing_key") == self.queue_name:
             with self._protection_lock:
                 self._set_protection(True)
-                # A task that finishes before the next `_protection_tick` would otherwise never be
-                # observed as busy, so its busy-to-idle transition (and thus protection release)
-                # would never fire.
+                # Manually mark this process as bust. A task that finishes very quickly, i.e. before the
+                # next protection_tick, would never otherwise set _was_busy correctly.
                 self._was_busy = True
             self.metric.on_task_received(request)
 

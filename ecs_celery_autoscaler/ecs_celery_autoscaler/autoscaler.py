@@ -68,10 +68,6 @@ class ScalingMetric(abc.ABC):
         """Returns (raw target worker count, extra fields for the scale-event log), before the caller
         applies the min/max clamp."""
 
-    def on_task_received(self, request) -> None:
-        """Optional hook fired from `_on_received` after scale-in protection is set; no-op by default."""
-
-
 class QueueDepthMetric(ScalingMetric):
     """Scales on Celery queue depth: ceil((broker queue length + in-flight tasks) / tasks_per_worker)."""
 
@@ -175,10 +171,9 @@ class EcsCeleryAutoscaler:
         if request is not None and request.delivery_info.get("routing_key") == self.queue_name:
             with self._protection_lock:
                 self._set_protection(True)
-                # Manually mark this process as bust. A task that finishes very quickly, i.e. before the
+                # Manually mark this process as busy. A task that finishes very quickly, i.e. before the
                 # next protection_tick, would never otherwise set _was_busy correctly.
                 self._was_busy = True
-            self.metric.on_task_received(request)
 
     def _on_postrun(self, task_id=None, **kwargs):
         threading.Thread(target=self.maybe_scale_service, daemon=True).start()

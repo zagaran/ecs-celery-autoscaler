@@ -13,7 +13,7 @@ from typing import Any
 
 import boto3
 from celery.app.control import flatten_reply
-from celery.signals import after_task_publish, task_postrun, task_received, worker_shutting_down
+from celery.signals import after_task_publish, task_received, worker_shutting_down
 from celery.worker import state as worker_state
 from celery.worker.control import inspect_command
 from celery.worker.request import Request as WorkerRequest
@@ -21,7 +21,7 @@ from celery.worker.request import Request as WorkerRequest
 log = logging.getLogger("ecs_celery_autoscaler")
 
 LOCK_TIMEOUT = 90 # Set to be higher than boto's 60s timeout
-LOCK_BLOCKING_TIMEOUT = 10
+RECONCILE_POLL_INTERVAL = 30
 PROTECTION_POLL_INTERVAL = 5
 RESUME_CHECK_RETRIES = 6
 RESUME_CHECK_INTERVAL = 15
@@ -64,7 +64,7 @@ class ScalingMetric(abc.ABC):
         self.redis_client = autoscaler.redis_client
 
     @abc.abstractmethod
-    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
+    def target_worker_count(self, *, pending: int) -> tuple[int, dict]:
         """Returns (raw target worker count, extra fields for the scale-event log), before the caller
         applies the min/max clamp."""
 
@@ -74,7 +74,7 @@ class QueueDepthMetric(ScalingMetric):
     def __init__(self, tasks_per_worker: int = 1):
         self.tasks_per_worker = tasks_per_worker
 
-    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
+    def target_worker_count(self, *, pending: int) -> tuple[int, dict]:
         queue_len = self.redis_client.llen(self.autoscaler.queue_name)
         outstanding = queue_len + pending
         return math.ceil(outstanding / self.tasks_per_worker), {"queue_len": queue_len}
@@ -119,6 +119,7 @@ class EcsCeleryAutoscaler:
         self._protection_lock = threading.Lock()
         self._shutting_down = threading.Event()
         self._was_busy = False
+        self._scale_check_running = threading.Event()
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
@@ -151,17 +152,28 @@ class EcsCeleryAutoscaler:
         # Wire signals
         after_task_publish.connect(self._on_publish, weak=False)
         task_received.connect(self._on_received, weak=False)
-        task_postrun.connect(self._on_postrun, weak=False)
         worker_shutting_down.connect(self._on_shutdown, weak=False)
 
-        # Start background thread responsible for renewing task protection
+        # Start background threads responsible for renewing task protection and for periodically
+        # re-checking desiredCount as a backstop to signal-triggered scaling
         threading.Thread(target=self._protection_loop, daemon=True).start()
+        threading.Thread(target=self._reconcile_loop, daemon=True).start()
 
         log.info("Starting autoscaler with process_id: %s", self.process_id)
 
     def _on_publish(self, sender=None, routing_key=None, **kwargs):
-        if routing_key == self.queue_name:
-            threading.Thread(target=self.maybe_scale_service, daemon=True).start()
+        if routing_key == self.queue_name and not self._scale_check_running.is_set():
+            threading.Thread(target=self._run_scale_check, daemon=True).start()
+
+    def _run_scale_check(self) -> None:
+        """Coalesces bursts of `_on_publish` events: while one check is in flight, later publishes
+        just see the flag set and skip spawning a thread, since the in-flight call reads live state
+        and `_reconcile_loop` backstops any arrival it still manages to miss."""
+        self._scale_check_running.set()
+        try:
+            self.maybe_scale_service()
+        finally:
+            self._scale_check_running.clear()
 
     def _on_received(self, sender=None, request=None, **kwargs):
         """Fires the instant a task is delivered, before it's necessarily reserved or has a pool
@@ -175,8 +187,13 @@ class EcsCeleryAutoscaler:
                 # next protection_tick, would never otherwise set _was_busy correctly.
                 self._was_busy = True
 
-    def _on_postrun(self, task_id=None, **kwargs):
-        threading.Thread(target=self.maybe_scale_service, daemon=True).start()
+    def _reconcile_loop(self) -> None:
+        """Backstop for `_on_publish`: a signal-triggered attempt that loses the lock to a
+        concurrent caller is simply skipped rather than queued, so this guarantees the service is
+        still re-checked at least every RECONCILE_POLL_INTERVAL seconds regardless of task volume."""
+        while True:
+            time.sleep(RECONCILE_POLL_INTERVAL)
+            self.maybe_scale_service()
 
     def _on_shutdown(self, sender=None, **kwargs):
         """Fires before the process exits; releases protection only if genuinely idle, since a busy
@@ -201,28 +218,40 @@ class EcsCeleryAutoscaler:
     def maybe_scale_service(self) -> None:
         """Recomputes the target worker count and scales toward it. Safe even mid-task, since ECS
         scale-in protection guarantees a busy container is never terminated regardless of
-        desiredCount."""
+        desiredCount.
+
+        Acquires the lock non-blocking: under contention this simply skips the check rather than
+        waiting, since `_on_publish` fires far more often than the lock can be serviced under high
+        task volume, and `_reconcile_loop` guarantees a fresh check within RECONCILE_POLL_INTERVAL
+        seconds regardless."""
         if not self.enabled:
             return
+        lock = self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT)
+        if not lock.acquire(blocking=False):
+            return
         try:
-            with self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT, blocking_timeout=LOCK_BLOCKING_TIMEOUT):
-                current = self._desired_count()
-                pending, busy_workers = self._pending_and_busy_workers()
-                raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
-                # Never target fewer workers than are currently busy
-                target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
-                if target != current:
-                    self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
-                    log.info(
-                        "scaled %s to desiredCount=%d (pending=%d, busy_workers=%d, %s)",
-                        self.ecs_service,
-                        target,
-                        pending,
-                        busy_workers,
-                        ", ".join(f"{k}={v}" for k, v in log_extra.items()),
-                    )
+            current = self._desired_count()
+            pending, busy_workers = self._pending_and_busy_workers()
+            raw_target, log_extra = self.metric.target_worker_count(pending=pending)
+            # Never target fewer workers than are currently busy
+            target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
+            if target != current:
+                self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
+                log.info(
+                    "scaled %s to desiredCount=%d (pending=%d, busy_workers=%d, %s)",
+                    self.ecs_service,
+                    target,
+                    pending,
+                    busy_workers,
+                    ", ".join(f"{k}={v}" for k, v in log_extra.items()),
+                )
         except Exception:
             log.exception("Autoscaling failed for %s", self.ecs_service)
+        finally:
+            try:
+                lock.release()
+            except Exception:
+                log.exception("failed to release autoscaler lock for %s", self.ecs_service)
 
     def _pending_and_busy_workers(self) -> tuple[int, int]:
         """Cluster-wide count of tasks for this queue that are received but not finished, plus how

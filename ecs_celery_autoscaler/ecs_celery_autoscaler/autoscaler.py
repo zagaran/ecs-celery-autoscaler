@@ -32,8 +32,14 @@ OUTSTANDING_COMMAND = "ecs_celery_autoscaler_outstanding"
 
 def _redis_client_from_broker_url(broker_url: str | None) -> redis.Redis:
     if not broker_url:
-        raise ValueError("celery_app has no broker_url configured; pass redis_client explicitly")
-    return redis.from_url(broker_url)
+        raise ValueError("EcsCeleryAutoscaler: celery_app has no broker_url configured; pass redis_client explicitly")
+    try:
+        return redis.from_url(broker_url)
+    except ValueError as e:
+        raise ValueError(
+            f"EcsCeleryAutoscaler could not derive a redis client from celery_app.conf.broker_url ({e}); "
+            "pass redis_client explicitly instead"
+        ) from e
 
 
 def _matches_queue(request, queue_name) -> bool:

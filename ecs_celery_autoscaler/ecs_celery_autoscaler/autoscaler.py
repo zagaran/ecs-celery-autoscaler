@@ -115,11 +115,11 @@ class EcsCeleryAutoscaler:
         self.process_id = str(uuid.uuid4())
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
+        self._protection_lock = threading.Lock() # Lock to prevent concurrent processes from racing to update task protection
+        self._shutting_down = threading.Event() # Flag to let concurrent processes know task shutdown has begun
+        self._scale_check_running = threading.Event() # Flag to prevent concurrent processes from doing unnecessary scaling checks
         self._consumer = None
-        self._protection_lock = threading.Lock()
-        self._shutting_down = threading.Event()
         self._was_busy = False
-        self._scale_check_running = threading.Event()
 
     def install(self) -> None:
         """Wire the signal handlers and start the protection renewal heartbeat."""
@@ -162,6 +162,8 @@ class EcsCeleryAutoscaler:
         log.info("Starting autoscaler with process_id: %s", self.process_id)
 
     def _on_publish(self, sender=None, routing_key=None, **kwargs):
+        # Only check scaling if there is not already a scale check running. maybe_scale_service
+        # calculates current state itself, so multiple processes doing it would be duplicated work
         if routing_key == self.queue_name and not self._scale_check_running.is_set():
             threading.Thread(target=self._run_scale_check, daemon=True).start()
 

@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 import boto3
+import redis
 from celery.app.control import flatten_reply
 from celery.signals import after_task_publish, task_received, worker_shutting_down
 from celery.worker import state as worker_state
@@ -27,6 +28,18 @@ RESUME_CHECK_RETRIES = 6
 RESUME_CHECK_INTERVAL = 15
 INSPECT_TIMEOUT = 1.0
 OUTSTANDING_COMMAND = "ecs_celery_autoscaler_outstanding"
+
+
+def _redis_client_from_broker_url(broker_url: str | None) -> redis.Redis:
+    if not broker_url:
+        raise ValueError("EcsCeleryAutoscaler: celery_app has no broker_url configured; pass redis_client explicitly")
+    try:
+        return redis.from_url(broker_url)
+    except ValueError as e:
+        raise ValueError(
+            f"EcsCeleryAutoscaler could not derive a redis client from celery_app.conf.broker_url ({e}); "
+            "pass redis_client explicitly instead"
+        ) from e
 
 
 def _matches_queue(request, queue_name) -> bool:
@@ -89,7 +102,6 @@ class EcsCeleryAutoscaler:
         self,
         *,
         celery_app,
-        redis_client,
         ecs_cluster: str,
         ecs_service: str,
         aws_region: str,
@@ -98,10 +110,10 @@ class EcsCeleryAutoscaler:
         min_workers: int = 0,
         max_workers: int = 1,
         protection_expires_minutes: int = 60,
+        redis_client: redis.Redis | None = None,
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
-        self.redis_client = redis_client
         self.ecs_cluster = ecs_cluster
         self.ecs_service = ecs_service
         self.metric = metric
@@ -113,6 +125,7 @@ class EcsCeleryAutoscaler:
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
         self.metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
         self.process_id = str(uuid.uuid4())
+        self.redis_client = redis_client
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
         self._protection_lock = threading.Lock() # Lock to prevent concurrent processes from racing to update task protection
@@ -146,6 +159,9 @@ class EcsCeleryAutoscaler:
                 "prefetch tasks faster than they can run them, starving newly scaled-up workers of "
                 "work. It is strongly recommended to enable this setting."
             )
+
+        if self.redis_client is None:
+            self.redis_client = _redis_client_from_broker_url(self.celery_app.conf.broker_url)
 
         self.metric.bind(self)
 

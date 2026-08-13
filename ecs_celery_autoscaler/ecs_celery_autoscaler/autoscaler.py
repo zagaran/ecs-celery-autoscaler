@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 import boto3
+import redis
 from celery.app.control import flatten_reply
 from celery.signals import after_task_publish, task_received, worker_shutting_down
 from celery.worker import state as worker_state
@@ -27,6 +28,12 @@ RESUME_CHECK_RETRIES = 6
 RESUME_CHECK_INTERVAL = 15
 INSPECT_TIMEOUT = 1.0
 OUTSTANDING_COMMAND = "ecs_celery_autoscaler_outstanding"
+
+
+def _redis_client_from_broker_url(broker_url: str | None) -> redis.Redis:
+    if not broker_url:
+        raise ValueError("celery_app has no broker_url configured; pass redis_client explicitly")
+    return redis.from_url(broker_url)
 
 
 def _matches_queue(request, queue_name) -> bool:
@@ -89,7 +96,6 @@ class EcsCeleryAutoscaler:
         self,
         *,
         celery_app,
-        redis_client,
         ecs_cluster: str,
         ecs_service: str,
         aws_region: str,
@@ -98,10 +104,11 @@ class EcsCeleryAutoscaler:
         min_workers: int = 0,
         max_workers: int = 1,
         protection_expires_minutes: int = 60,
+        redis_client: redis.Redis | None = None,
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
-        self.redis_client = redis_client
+        self.redis_client = redis_client or _redis_client_from_broker_url(celery_app.conf.broker_url)
         self.ecs_cluster = ecs_cluster
         self.ecs_service = ecs_service
         self.metric = metric

@@ -108,7 +108,6 @@ class EcsCeleryAutoscaler:
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
-        self.redis_client = redis_client
         self.ecs_cluster = ecs_cluster
         self.ecs_service = ecs_service
         self.metric = metric
@@ -120,6 +119,7 @@ class EcsCeleryAutoscaler:
         self.agent_uri = os.environ.get("ECS_AGENT_URI")
         self.metadata_uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
         self.process_id = str(uuid.uuid4())
+        self.redis_client = redis_client
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
         self._protection_lock = threading.Lock() # Lock to prevent concurrent processes from racing to update task protection

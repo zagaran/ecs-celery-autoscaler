@@ -108,7 +108,7 @@ class EcsCeleryAutoscaler:
         ecs_client: Any = None,
     ):
         self.celery_app = celery_app
-        self.redis_client = redis_client or _redis_client_from_broker_url(celery_app.conf.broker_url)
+        self.redis_client = redis_client
         self.ecs_cluster = ecs_cluster
         self.ecs_service = ecs_service
         self.metric = metric
@@ -153,6 +153,9 @@ class EcsCeleryAutoscaler:
                 "prefetch tasks faster than they can run them, starving newly scaled-up workers of "
                 "work. It is strongly recommended to enable this setting."
             )
+
+        if self.redis_client is None:
+            self.redis_client = _redis_client_from_broker_url(self.celery_app.conf.broker_url)
 
         self.metric.bind(self)
 

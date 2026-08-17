@@ -114,20 +114,26 @@ class QueueLatencyMetric(ScalingMetric):
 
     `scale_up_threshold_seconds` and `scale_down_threshold_seconds` form a dead band: latency between
     them holds the current count steady. A single threshold would mean every evaluation with fresh
-    latency data commands a +1 or -1 move with no resting point, so even a workload perfectly matched
-    to its current worker count would ratchet down, overshoot, and correct back up forever."""
+    latency data commands a move with no resting point, so even a workload perfectly matched to its
+    current worker count would ratchet down, overshoot, and correct back up forever.
+
+    `scale_up_step` and `scale_down_step` control how large each of those moves is."""
 
     def __init__(
         self,
         scale_up_threshold_seconds: float = 10.0,
         scale_down_threshold_seconds: float = 1.0,
         window_seconds: int = 300,
+        scale_up_step: int = 1,
+        scale_down_step: int = 1,
     ):
         if scale_down_threshold_seconds >= scale_up_threshold_seconds:
             raise ValueError("scale_down_threshold_seconds must be less than scale_up_threshold_seconds")
         self.scale_up_threshold_seconds = scale_up_threshold_seconds
         self.scale_down_threshold_seconds = scale_down_threshold_seconds
         self.window_seconds = window_seconds
+        self.scale_up_step = scale_up_step
+        self.scale_down_step = scale_down_step
 
     def bind(self, autoscaler: EcsCeleryAutoscaler) -> None:
         super().bind(autoscaler)
@@ -148,17 +154,21 @@ class QueueLatencyMetric(ScalingMetric):
             return
         try:
             wait = max(0.0, time.time() - float(published_at))
+            # Add random hex string to make wait time unique. This allows multiple tasks with the same
+            # wait time to be represented in the set
             member = f"{wait:.4f}:{uuid.uuid4().hex[:8]}"
             with self.redis_client.pipeline() as pipe:
                 pipe.zadd(self._latency_key, {member: time.time()})
+                # Add a TTL to the wait time
                 pipe.expire(self._latency_key, self.window_seconds * 2)
                 pipe.execute()
         except Exception:
             log.exception("failed to record queue latency sample for %s", self.autoscaler.ecs_service)
 
     def _current_latency(self) -> float | None:
-        """Returns the max sample recorded within `window_seconds`, pruning older ones first."""
+        """Returns the max sample recorded within `window_seconds`, pruning samples outside the window first."""
         redis_client = self.redis_client
+        # Remove samples taken before the window
         redis_client.zremrangebyscore(self._latency_key, "-inf", time.time() - self.window_seconds)
         members = redis_client.zrange(self._latency_key, 0, -1)
         if not members:
@@ -177,9 +187,9 @@ class QueueLatencyMetric(ScalingMetric):
                 return (1 if queue_len > 0 else 0), log_extra
             return current, log_extra
         if latency > self.scale_up_threshold_seconds:
-            return current + 1, log_extra
+            return current + self.scale_up_step, log_extra
         if latency < self.scale_down_threshold_seconds:
-            return current - 1, log_extra
+            return current - self.scale_down_step, log_extra
         return current, log_extra
 
 

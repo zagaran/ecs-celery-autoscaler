@@ -17,7 +17,6 @@ from celery.app.control import flatten_reply
 from celery.signals import (
     after_task_publish,
     before_task_publish,
-    task_postrun,
     task_received,
     worker_shutting_down,
 )

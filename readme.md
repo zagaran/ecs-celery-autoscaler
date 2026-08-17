@@ -39,11 +39,9 @@ In Django you can enable these settings with
 
 ```python
 from ecs_celery_autoscaler import EcsCeleryAutoscaler, QueueDepthMetric
-import redis
 
 scaler = EcsCeleryAutoscaler(
     celery_app=app,
-    redis_client=redis.Redis(host="...", decode_responses=True),
     ecs_cluster="my-ecs-cluster",
     ecs_service="my-celery-worker-service",
     aws_region="us-east-1",
@@ -57,6 +55,8 @@ scaler = EcsCeleryAutoscaler(
 scaler.install()
 ```
 
+- `redis_client`: optional. By default, it's derived from `celery_app.conf.broker_url`, which covers a standard 
+  `redis://` or `rediss://` broker URL. Pass this explicitly if your broker isn't reachable via `broker_url` alone
 - `min_workers` / `max_workers`: the range `desiredCount` is scaled within. Defaults (`0`/`1`)
 - `metric`: the `ScalingMetric` that decides the target worker count every time the autoscaler recomputes it.
   Built-in options:

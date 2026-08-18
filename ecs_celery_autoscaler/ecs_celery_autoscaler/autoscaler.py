@@ -83,7 +83,7 @@ class ScalingMetric(abc.ABC):
         self.redis_client = autoscaler.redis_client
 
     @abc.abstractmethod
-    def target_worker_count(self, *, pending: int) -> tuple[int, dict]:
+    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
         """Returns (raw target worker count, extra fields for the scale-event log), before the caller
         applies the min/max clamp."""
 
@@ -97,7 +97,7 @@ class QueueDepthMetric(ScalingMetric):
     def __init__(self, tasks_per_worker: int = 1):
         self.tasks_per_worker = tasks_per_worker
 
-    def target_worker_count(self, *, pending: int) -> tuple[int, dict]:
+    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
         queue_len = self.redis_client.llen(self.autoscaler.queue_name)
         outstanding = queue_len + pending
         return math.ceil(outstanding / self.tasks_per_worker), {"queue_len": queue_len}
@@ -351,7 +351,7 @@ class EcsCeleryAutoscaler:
         try:
             current = self._desired_count()
             pending, busy_workers = self._pending_and_busy_workers()
-            raw_target, log_extra = self.metric.target_worker_count(pending=pending)
+            raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
             # Never target fewer workers than are currently busy
             target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
             if target != current:

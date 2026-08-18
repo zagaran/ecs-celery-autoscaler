@@ -110,7 +110,10 @@ class QueueLatencyMetric(ScalingMetric):
     get stamped and no samples ever accumulate
 
     `scale_up_threshold_seconds` and `scale_down_threshold_seconds` form a dead band: latency between
-    them holds the current count steady.
+    them holds the current count steady. No samples in the window is treated the same as being under
+    `scale_down_threshold_seconds`, unless the broker queue is non-empty — e.g. right after a bootstrap,
+    before the new worker has had a chance to receive anything and report in — in which case it holds
+    steady instead of scaling back down out from under it.
 
     `scale_up_step` and `scale_down_step` control how large each of those moves is."""
 
@@ -174,14 +177,18 @@ class QueueLatencyMetric(ScalingMetric):
         latency = self._current_latency()
         log_extra = {"queue_latency": f"{latency:.2f}s" if latency is not None else "n/a"}
         if latency is None:
+            queue_len = self.redis_client.llen(self.autoscaler.queue_name)
             if current == 0:
                 # Handle when scaled to 0 and therefore have no latency data.
                 # Bootstrap one worker off the raw broker queue length —
-                # once it's running, its own observations take over from the next evaluation on.
-                queue_len = self.redis_client.llen(self.autoscaler.queue_name)
                 return (1 if queue_len > 0 else 0), log_extra
-            # No samples in the window means nothing has waited recently, so it's safe to scale
-            # down the same as if latency were under scale_down_threshold_seconds.
+            if queue_len > 0:
+                # Tasks are queued but nothing has reported a wait time for them yet — e.g. a
+                # just-bootstrapped worker hasn't started consuming yet. Hold steady rather than
+                # scaling back down out from under it before it gets a chance to report in.
+                return current, log_extra
+            # Nothing queued and no samples in the window means nothing has waited recently, so
+            # it's safe to scale down the same as if latency were under scale_down_threshold_seconds.
             return current - self.scale_down_step, log_extra
         if latency > self.scale_up_threshold_seconds:
             return current + self.scale_up_step, log_extra

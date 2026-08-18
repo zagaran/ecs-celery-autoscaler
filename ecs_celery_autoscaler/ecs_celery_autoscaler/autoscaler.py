@@ -232,6 +232,7 @@ class EcsCeleryAutoscaler:
         self.redis_client = redis_client
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
+        self._last_scaled_key = f"ecs-celery-autoscaler:{self.ecs_service}:last-scaled-at"
         self._protection_lock = threading.Lock() # Lock to prevent concurrent processes from racing to update task protection
         self._shutting_down = threading.Event() # Flag to let concurrent processes know task shutdown has begun
         self._scale_check_running = threading.Event() # Flag to prevent concurrent processes from doing unnecessary scaling checks
@@ -346,7 +347,10 @@ class EcsCeleryAutoscaler:
         Acquires the lock non-blocking: under contention this simply skips the check rather than
         waiting, since `_on_publish` fires far more often than the lock can be serviced under high
         task volume, and `_reconcile_loop` guarantees a fresh check within RECONCILE_POLL_INTERVAL
-        seconds regardless."""
+        seconds regardless. Every process that calls `install()` runs its own independently-timed
+        `_reconcile_loop`, so actual desiredCount changes are further throttled to at most one per
+        RECONCILE_POLL_INTERVAL seconds via a shared cooldown key, claimed only once `update_service`
+        succeeds — otherwise the same signal could get acted on repeatedly by different processes"""
         if not self.enabled:
             return
         lock = self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT)
@@ -358,8 +362,9 @@ class EcsCeleryAutoscaler:
             raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
             # Never target fewer workers than are currently busy
             target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
-            if target != current:
+            if target != current and not self.redis_client.exists(self._last_scaled_key):
                 self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
+                self._claim_scaling_cooldown()
                 log.info(
                     "scaled %s to desiredCount=%d (pending=%d, busy_workers=%d, %s)",
                     self.ecs_service,
@@ -375,6 +380,14 @@ class EcsCeleryAutoscaler:
                 lock.release()
             except Exception:
                 log.exception("failed to release autoscaler lock for %s", self.ecs_service)
+
+    def _claim_scaling_cooldown(self) -> None:
+        """Marks that a desiredCount change was just made, so no process acts again for
+        RECONCILE_POLL_INTERVAL seconds. Called only after `update_service` succeeds — claiming it
+        eagerly (before knowing the call succeeds) would waste the cooldown on a failed attempt and
+        needlessly delay the next legitimate retry. Backed by Redis since the cooldown must hold
+        across every process racing for `_lock_key`, not just the caller."""
+        self.redis_client.set(self._last_scaled_key, self.process_id, ex=RECONCILE_POLL_INTERVAL)
 
     def _pending_and_busy_workers(self) -> tuple[int, int]:
         """Cluster-wide count of tasks for this queue that are received but not finished, plus how

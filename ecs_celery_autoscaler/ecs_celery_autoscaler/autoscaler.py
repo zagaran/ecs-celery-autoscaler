@@ -190,7 +190,8 @@ class QueueLatencyMetric(ScalingMetric):
             # Nothing queued and no samples in the window means nothing has waited recently, so
             # it's safe to scale down the same as if latency were under scale_down_threshold_seconds.
             return current - self.scale_down_step, log_extra
-        if latency > self.scale_up_threshold_seconds:
+        if latency > self.scale_up_threshold_seconds and pending > 0:
+            # Require live evidence of outstanding work, not just a historical sample
             return current + self.scale_up_step, log_extra
         if latency < self.scale_down_threshold_seconds:
             return current - self.scale_down_step, log_extra

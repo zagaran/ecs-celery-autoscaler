@@ -66,7 +66,8 @@ scaler.install()
   - `QueueLatencyMetric(scale_up_threshold_seconds, scale_down_threshold_seconds, window_seconds=300, scale_up_step=1, scale_down_step=1)`:
     instead of reacting to queue length, scales based on how long tasks are waiting to be picked up.
     Scales up by `scale_up_step` if any task has waited longer than `scale_up_threshold_seconds`
-    within the last `window_seconds`; scales down by `scale_down_step` if the longest wait in that window is under
+    within the last `window_seconds` **and** there's currently live outstanding work.
+    Scales down by `scale_down_step` if the longest wait in that window is under
     `scale_down_threshold_seconds`, or if no samples exist in the window at all and the broker queue is
     empty (nothing has waited recently because nothing's waiting); otherwise holds steady. 
   - To define your own, subclass `ScalingMetric` and implement

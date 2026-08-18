@@ -362,6 +362,7 @@ class EcsCeleryAutoscaler:
             raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
             # Never target fewer workers than are currently busy
             target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
+            # Do not scale if another process has scaled within RECONCILE_POLL_INTERVAL
             if target != current and not self.redis_client.exists(self._last_scaled_key):
                 self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
                 self._claim_scaling_cooldown()

@@ -84,6 +84,21 @@ scaler.install()
 - `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
   disable the library entirely
 
+# Logging
+This library logs via `logging.getLogger("ecs_celery_autoscaler")` and doesn't attach any handlers of
+its own, so its output only shows up if your application's logging configuration reaches that logger.
+Frameworks that disable loggers not explicitly listed in their config — e.g. Django's `LOGGING` setting,
+which defaults `disable_existing_loggers` to `True` — will silently drop every message from this logger,
+including scaling decisions, unless you add it explicitly.
+
+For Django, add an entry to `LOGGING["loggers"]`:
+```python
+"ecs_celery_autoscaler": {
+    "handlers": ["console"],
+    "level": "INFO",
+},
+```
+
 # How Does it Work?
 This library utilizes Celery's signals along with redis statistics to track queue depth and each worker's processing state.
 

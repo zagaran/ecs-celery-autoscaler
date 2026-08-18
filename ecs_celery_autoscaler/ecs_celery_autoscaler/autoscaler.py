@@ -107,15 +107,10 @@ class QueueLatencyMetric(ScalingMetric):
     """Scales by ratcheting the current worker count based on how long tasks wait in the queue before
     being received, measured by diffing a publish-time timestamp stamped into the task headers. Every
     process that calls `install()` must use this same metric, including producers, or no timestamps
-    get stamped and this metric silently holds `current` forever. With zero workers running there's
-    also no consumer to ever measure a wait with, so `target_worker_count` falls back to bootstrapping
-    one worker off the raw broker queue length in that specific case; every other decision is latency-
-    based.
+    get stamped and no samples ever accumulate
 
     `scale_up_threshold_seconds` and `scale_down_threshold_seconds` form a dead band: latency between
-    them holds the current count steady. A single threshold would mean every evaluation with fresh
-    latency data commands a move with no resting point, so even a workload perfectly matched to its
-    current worker count would ratchet down, overshoot, and correct back up forever.
+    them holds the current count steady.
 
     `scale_up_step` and `scale_down_step` control how large each of those moves is."""
 
@@ -185,7 +180,9 @@ class QueueLatencyMetric(ScalingMetric):
                 # once it's running, its own observations take over from the next evaluation on.
                 queue_len = self.redis_client.llen(self.autoscaler.queue_name)
                 return (1 if queue_len > 0 else 0), log_extra
-            return current, log_extra
+            # No samples in the window means nothing has waited recently, so it's safe to scale
+            # down the same as if latency were under scale_down_threshold_seconds.
+            return current - self.scale_down_step, log_extra
         if latency > self.scale_up_threshold_seconds:
             return current + self.scale_up_step, log_extra
         if latency < self.scale_down_threshold_seconds:

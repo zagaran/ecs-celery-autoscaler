@@ -94,8 +94,16 @@ including scaling decisions, unless you add it explicitly.
 For Django, add an entry to `LOGGING["loggers"]`:
 ```python
 "ecs_celery_autoscaler": {
-    "handlers": ["console"],
+    "handlers": ["console_info"],
     "level": "INFO",
+},
+```
+and an entry to `LOGGING["handlers"]`:
+```python
+"console_info": {
+    "level": "INFO",
+    "class": "logging.StreamHandler",
+    "formatter": "simple",
 },
 ```
 

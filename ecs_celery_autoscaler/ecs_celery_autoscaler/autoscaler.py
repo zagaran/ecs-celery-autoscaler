@@ -14,7 +14,12 @@ from typing import Any
 import boto3
 import redis
 from celery.app.control import flatten_reply
-from celery.signals import after_task_publish, task_received, worker_shutting_down
+from celery.signals import (
+    after_task_publish,
+    before_task_publish,
+    task_received,
+    worker_shutting_down,
+)
 from celery.worker import state as worker_state
 from celery.worker.control import inspect_command
 from celery.worker.request import Request as WorkerRequest
@@ -28,6 +33,7 @@ RESUME_CHECK_RETRIES = 6
 RESUME_CHECK_INTERVAL = 15
 INSPECT_TIMEOUT = 1.0
 OUTSTANDING_COMMAND = "ecs_celery_autoscaler_outstanding"
+PUBLISHED_AT_HEADER = "ecs_celery_autoscaler_published_at"
 
 
 def _redis_client_from_broker_url(broker_url: str | None) -> redis.Redis:
@@ -77,9 +83,13 @@ class ScalingMetric(abc.ABC):
         self.redis_client = autoscaler.redis_client
 
     @abc.abstractmethod
-    def target_worker_count(self, *, pending: int) -> tuple[int, dict]:
+    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
         """Returns (raw target worker count, extra fields for the scale-event log), before the caller
         applies the min/max clamp."""
+
+    def on_task_received(self, request) -> None:
+        """Optional hook fired from `_on_received` after scale-in protection is set; no-op by default."""
+
 
 class QueueDepthMetric(ScalingMetric):
     """Scales on Celery queue depth: ceil((broker queue length + in-flight tasks) / tasks_per_worker)."""
@@ -87,10 +97,105 @@ class QueueDepthMetric(ScalingMetric):
     def __init__(self, tasks_per_worker: int = 1):
         self.tasks_per_worker = tasks_per_worker
 
-    def target_worker_count(self, *, pending: int) -> tuple[int, dict]:
+    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
         queue_len = self.redis_client.llen(self.autoscaler.queue_name)
         outstanding = queue_len + pending
         return math.ceil(outstanding / self.tasks_per_worker), {"queue_len": queue_len}
+
+
+class QueueLatencyMetric(ScalingMetric):
+    """Scales by ratcheting the current worker count based on how long tasks wait in the queue before
+    being received, measured by diffing a publish-time timestamp stamped into the task headers. Every
+    process that calls `install()` must use this same metric, including producers, or no timestamps
+    get stamped and no samples ever accumulate
+
+    `scale_up_threshold_seconds` and `scale_down_threshold_seconds` form a dead band: latency between
+    them holds the current count steady. No samples in the window is treated the same as being under
+    `scale_down_threshold_seconds`, unless the broker queue is non-empty — e.g. right after a bootstrap,
+    before the new worker has had a chance to receive anything and report in — in which case it holds
+    steady instead of scaling back down out from under it.
+
+    `scale_up_step` and `scale_down_step` control how large each of those moves is."""
+
+    def __init__(
+        self,
+        scale_up_threshold_seconds: float = 10.0,
+        scale_down_threshold_seconds: float = 1.0,
+        window_seconds: int = 300,
+        scale_up_step: int = 1,
+        scale_down_step: int = 1,
+    ):
+        if scale_down_threshold_seconds >= scale_up_threshold_seconds:
+            raise ValueError("scale_down_threshold_seconds must be less than scale_up_threshold_seconds")
+        self.scale_up_threshold_seconds = scale_up_threshold_seconds
+        self.scale_down_threshold_seconds = scale_down_threshold_seconds
+        self.window_seconds = window_seconds
+        self.scale_up_step = scale_up_step
+        self.scale_down_step = scale_down_step
+
+    def bind(self, autoscaler: EcsCeleryAutoscaler) -> None:
+        super().bind(autoscaler)
+        self._latency_key = f"ecs-celery-autoscaler:{autoscaler.ecs_service}:queue-latency-samples"
+        before_task_publish.connect(self._on_before_publish, weak=False)
+
+    def _on_before_publish(self, sender=None, headers=None, routing_key=None, **kwargs):
+        if routing_key == self.autoscaler.queue_name and headers is not None:
+            headers[PUBLISHED_AT_HEADER] = time.time()
+
+    def on_task_received(self, request) -> None:
+        """Records this task's queue wait as a sample, skipping delayed tasks (eta/countdown/backoff
+        retries) since their wait is intentional, not backlog."""
+        if request.eta is not None:
+            return
+        published_at = request.message.headers.get(PUBLISHED_AT_HEADER)
+        if published_at is None:
+            return
+        try:
+            wait = max(0.0, time.time() - float(published_at))
+            # Add random hex string to make wait time unique. This allows multiple tasks with the same
+            # wait time to be represented in the set
+            member = f"{wait:.4f}:{uuid.uuid4().hex[:8]}"
+            with self.redis_client.pipeline() as pipe:
+                pipe.zadd(self._latency_key, {member: time.time()})
+                # Add a TTL to the wait time
+                pipe.expire(self._latency_key, self.window_seconds * 2)
+                pipe.execute()
+        except Exception:
+            log.exception("failed to record queue latency sample for %s", self.autoscaler.ecs_service)
+
+    def _current_latency(self) -> float | None:
+        """Returns the max sample recorded within `window_seconds`, pruning samples outside the window first."""
+        redis_client = self.redis_client
+        # Remove samples taken before the window
+        redis_client.zremrangebyscore(self._latency_key, "-inf", time.time() - self.window_seconds)
+        members = redis_client.zrange(self._latency_key, 0, -1)
+        if not members:
+            return None
+        return max(float((m.decode() if isinstance(m, bytes) else m).split(":", 1)[0]) for m in members)
+
+    def target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]:
+        latency = self._current_latency()
+        log_extra = {"queue_latency": f"{latency:.2f}s" if latency is not None else "n/a"}
+        if latency is None:
+            queue_len = self.redis_client.llen(self.autoscaler.queue_name)
+            if current == 0:
+                # Handle when scaled to 0 and therefore have no latency data.
+                # Bootstrap one worker off the raw broker queue length —
+                return (1 if queue_len > 0 else 0), log_extra
+            if queue_len > 0:
+                # Tasks are queued but nothing has reported a wait time for them yet — e.g. a
+                # just-bootstrapped worker hasn't started consuming yet. Hold steady rather than
+                # scaling back down out from under it before it gets a chance to report in.
+                return current, log_extra
+            # Nothing queued and no samples in the window means nothing has waited recently, so
+            # it's safe to scale down the same as if latency were under scale_down_threshold_seconds.
+            return current - self.scale_down_step, log_extra
+        if latency > self.scale_up_threshold_seconds and pending > 0:
+            # Require live evidence of outstanding work, not just a historical sample
+            return current + self.scale_up_step, log_extra
+        if latency < self.scale_down_threshold_seconds:
+            return current - self.scale_down_step, log_extra
+        return current, log_extra
 
 
 class EcsCeleryAutoscaler:
@@ -128,6 +233,7 @@ class EcsCeleryAutoscaler:
         self.redis_client = redis_client
         self._ecs = ecs_client or boto3.client("ecs", region_name=aws_region)
         self._lock_key = f"ecs-celery-autoscaler:{self.ecs_service}:lock"
+        self._last_scaled_key = f"ecs-celery-autoscaler:{self.ecs_service}:last-scaled-at"
         self._protection_lock = threading.Lock() # Lock to prevent concurrent processes from racing to update task protection
         self._shutting_down = threading.Event() # Flag to let concurrent processes know task shutdown has begun
         self._scale_check_running = threading.Event() # Flag to prevent concurrent processes from doing unnecessary scaling checks
@@ -204,6 +310,7 @@ class EcsCeleryAutoscaler:
                 # Manually mark this process as busy. A task that finishes very quickly, i.e. before the
                 # next protection_tick, would never otherwise set _was_busy correctly.
                 self._was_busy = True
+            self.metric.on_task_received(request)
 
     def _reconcile_loop(self) -> None:
         """Backstop for `_on_publish`: a signal-triggered attempt that loses the lock to a
@@ -241,7 +348,10 @@ class EcsCeleryAutoscaler:
         Acquires the lock non-blocking: under contention this simply skips the check rather than
         waiting, since `_on_publish` fires far more often than the lock can be serviced under high
         task volume, and `_reconcile_loop` guarantees a fresh check within RECONCILE_POLL_INTERVAL
-        seconds regardless."""
+        seconds regardless. Every process that calls `install()` runs its own independently-timed
+        `_reconcile_loop`, so actual desiredCount changes are further throttled to at most one per
+        RECONCILE_POLL_INTERVAL seconds via a shared cooldown key, claimed only once `update_service`
+        succeeds — otherwise the same signal could get acted on repeatedly by different processes"""
         if not self.enabled:
             return
         lock = self.redis_client.lock(self._lock_key, timeout=LOCK_TIMEOUT)
@@ -250,11 +360,13 @@ class EcsCeleryAutoscaler:
         try:
             current = self._desired_count()
             pending, busy_workers = self._pending_and_busy_workers()
-            raw_target, log_extra = self.metric.target_worker_count(pending=pending)
+            raw_target, log_extra = self.metric.target_worker_count(current=current, pending=pending)
             # Never target fewer workers than are currently busy
             target = max(busy_workers, min(self.max_workers, max(self.min_workers, raw_target)))
-            if target != current:
+            # Do not scale if another process has scaled within RECONCILE_POLL_INTERVAL
+            if target != current and not self.redis_client.exists(self._last_scaled_key):
                 self._ecs.update_service(cluster=self.ecs_cluster, service=self.ecs_service, desiredCount=target)
+                self._claim_scaling_cooldown()
                 log.info(
                     "scaled %s to desiredCount=%d (pending=%d, busy_workers=%d, %s)",
                     self.ecs_service,
@@ -270,6 +382,14 @@ class EcsCeleryAutoscaler:
                 lock.release()
             except Exception:
                 log.exception("failed to release autoscaler lock for %s", self.ecs_service)
+
+    def _claim_scaling_cooldown(self) -> None:
+        """Marks that a desiredCount change was just made, so no process acts again for
+        RECONCILE_POLL_INTERVAL seconds. Called only after `update_service` succeeds — claiming it
+        eagerly (before knowing the call succeeds) would waste the cooldown on a failed attempt and
+        needlessly delay the next legitimate retry. Backed by Redis since the cooldown must hold
+        across every process racing for `_lock_key`, not just the caller."""
+        self.redis_client.set(self._last_scaled_key, self.process_id, ex=RECONCILE_POLL_INTERVAL)
 
     def _pending_and_busy_workers(self) -> tuple[int, int]:
         """Cluster-wide count of tasks for this queue that are received but not finished, plus how

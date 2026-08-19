@@ -63,6 +63,13 @@ scaler.install()
   - `QueueDepthMetric(tasks_per_worker=1)`: scales to `ceil(outstanding_tasks / tasks_per_worker)`, where
     `outstanding_tasks` is the broker queue length plus in-flight tasks. Set `tasks_per_worker` to the number
     of worker processes each ECS task runs.
+  - `QueueLatencyMetric(scale_up_threshold_seconds, scale_down_threshold_seconds, window_seconds=300, scale_up_step=1, scale_down_step=1)`:
+    instead of reacting to queue length, scales based on how long tasks are waiting to be picked up.
+    Scales up by `scale_up_step` if any task has waited longer than `scale_up_threshold_seconds`
+    within the last `window_seconds` **and** there's currently live outstanding work.
+    Scales down by `scale_down_step` if the longest wait in that window is under
+    `scale_down_threshold_seconds`, or if no samples exist in the window at all and the broker queue is
+    empty (nothing has waited recently because nothing's waiting); otherwise holds steady. 
   - To define your own, subclass `ScalingMetric` and implement
     `target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]`.
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
@@ -76,13 +83,40 @@ scaler.install()
 - `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
   disable the library entirely
 
+# Logging
+This library logs via `logging.getLogger("ecs_celery_autoscaler")` and doesn't attach any handlers of
+its own, so its output only shows up if your application's logging configuration reaches that logger.
+Frameworks that disable loggers not explicitly listed in their config — e.g. Django's `LOGGING` setting,
+which defaults `disable_existing_loggers` to `True` — will silently drop every message from this logger,
+including scaling decisions, unless you add it explicitly.
+
+For Django, add an entry to `LOGGING["loggers"]`:
+```python
+"ecs_celery_autoscaler": {
+    "handlers": ["console_info"],
+    "level": "INFO",
+},
+```
+and an entry to `LOGGING["handlers"]`:
+```python
+"console_info": {
+    "level": "INFO",
+    "class": "logging.StreamHandler",
+    "formatter": "simple",
+},
+```
+
 # How Does it Work?
 This library utilizes Celery's signals along with redis statistics to track queue depth and each worker's processing state.
 
 **How many workers:** on every task publish and task completion, the target worker count is recomputed by the
 configured `metric` (see `metric` above), then clamped to `[min_workers, max_workers]` and to never go below the
 number of currently busy workers. The ECS service is then scaled up/down if the target count differs from the
-current count.
+current count. Every process that calls `.install()` — every worker task and every producer — evaluates this
+independently, so actual `desiredCount` changes are throttled to at most one per `RECONCILE_POLL_INTERVAL` 
+across all of them combined, via a shared Redis-backed cooldown; without it, the same still-relevant
+signal could get acted on repeatedly by different processes in quick succession instead of at the intended
+cadence.
 
 **Which worker is safe to remove:** Whenever a worker picks up a task it marks it as protected from scale-in via 
 ECS Task Protection. On task completion, it removes the protection.

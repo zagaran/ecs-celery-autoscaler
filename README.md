@@ -10,7 +10,7 @@ either run Beat as a sidecar in your web service or as an independent service.
 
 # Requirements
 1. Task server running on ECS
-2. Celery using a redis instance as the broker
+2. Celery using a Redis instance as the broker
 
 # Setup
 1. Add `ecs:DescribeServices`, `ecs:UpdateService`, `ecs:GetTaskProtection`, and `ecs:UpdateTaskProtection`
@@ -37,8 +37,6 @@ scaler = EcsCeleryAutoscaler(
 scaler.install()
 ```
 
-- `redis_client`: optional. By default, it's derived from `celery_app.conf.broker_url`, which covers a standard 
-  `redis://` or `rediss://` broker URL. Pass this explicitly if your broker isn't reachable via `broker_url` alone
 - `min_workers` / `max_workers`: the range `desiredCount` is scaled within. Defaults (`0`/`1`)
 - `metric`: the `ScalingMetric` that decides the target worker count every time the autoscaler recomputes it.
   Built-in options:
@@ -48,13 +46,12 @@ scaler.install()
   - To define your own, subclass `ScalingMetric` and implement
     `target_worker_count(self, *, current: int, pending: int) -> tuple[int, dict]`.
 - `protection_expires_minutes`: how long an ECS task scale-in protection grant lasts before it must be
-  renewed (this library renews automatically in the background for tasks that run longer than this).
+  renewed (this library attempts to renew automatically in the background for tasks that run longer than this).
   Set this to at least your longest anticipated task duration. ECS can refuse renewal calls while a
   deployment or scale-in is blocked on a protected task (see the deployment note below), so the
   original grant — not renewal — is what has to cover a task for its full duration in that situation.
-- After a worker releases its scale-in protection, it doesn't resume task consumption until it has
-  confirmed via the ECS task metadata endpoint that ECS hasn't already decided to stop it (checked a
-  few times, spaced out, since ECS can take a moment to record that decision after protection drops).
+- `redis_client`: optional. By default, it's derived from `celery_app.conf.broker_url`, which covers a standard 
+  `redis://` or `rediss://` broker URL. Pass this explicitly if your broker isn't reachable via `broker_url` alone
 - `AUTOSCALING_ENABLED` (environment variable, default enabled): set to `False` to
   disable the library entirely
 
@@ -77,7 +74,7 @@ In Django you can enable these settings with
    ```
 
 # How Does it Work?
-This library utilizes Celery's signals along with redis statistics to track queue depth and each worker's processing state.
+This library utilizes Celery's signals along with Redis statistics to track queue depth and each worker's processing state.
 
 **How many workers:** on every task publish and task completion, the target worker count is recomputed by the
 configured `metric` (see `metric` above), then clamped to `[min_workers, max_workers]` and to never go below the
@@ -88,7 +85,7 @@ current count.
 ECS Task Protection. On task completion, it removes the protection.
 
 > [!WARNING]
-> ECS honors task scale-in protection during deployments too — a rolling or blue/green deployment will not stop
+> ECS honors task scale-in protection during deployments too — a deployment will not stop
 > a protected task. If a deployment (or a manual `desiredCount` change) tries to converge below the number of
 > currently protected tasks, ECS marks that convergence `DEPLOYMENT_BLOCKED` and will refuse *all*
 > `UpdateTaskProtection` calls for the affected task until it's unblocked — including this library's own renewal

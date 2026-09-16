@@ -1,6 +1,6 @@
 [project]
 name = "ecs-celery-autoscaler"
-version = "0.1.4"
+version = "0.1.0"
 description = "Scale an ECS service's worker count on Celery task load"
 requires-python = ">=3.9"
 dependencies = [

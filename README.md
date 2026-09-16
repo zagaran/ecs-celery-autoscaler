@@ -1,4 +1,5 @@
 ECS Celery Autoscaler is a project that allows for scaling of ECS task infrastructure based on demand. 
+
 This library differs from other scaling options in two key ways:
 1. In-progress tasks are protected from termination during scale-down. This means
 tasks complete safely before their instance is removed. 
